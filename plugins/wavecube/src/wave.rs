@@ -88,10 +88,13 @@ pub enum Preset {
     Ramps16,
     Swell,
     Duck8,
+    TrimIn,
+    TrimOut,
+    TapeStart,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 20] = [
+    pub const ALL: [Preset; 23] = [
         Preset::Sine,
         Preset::Triangle,
         Preset::SawUp,
@@ -112,6 +115,9 @@ impl Preset {
         Preset::Ramps16,
         Preset::Swell,
         Preset::Duck8,
+        Preset::TrimIn,
+        Preset::TrimOut,
+        Preset::TapeStart,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -135,6 +141,9 @@ impl Preset {
             Preset::Ramps16 => "Ramps 1/16",
             Preset::Swell => "Swell",
             Preset::Duck8 => "Duck 1/8",
+            Preset::TrimIn => "Fade in",
+            Preset::TrimOut => "Fade out",
+            Preset::TapeStart => "Tape start",
         }
     }
 }
@@ -207,6 +216,9 @@ impl Wave {
                 w
             }
             Preset::Swell => Self::from(&[Pt::new(0.0, 0.0, 0.6), Pt::new(0.9, 1.0, 0.0), Pt::new(1.0, 0.0, 0.0)]),
+            Preset::TrimIn => Self::from(&[Pt::new(0.0, 0.0, -0.3), Pt::new(0.12, 1.0, 0.0), Pt::new(1.0, 1.0, 0.0)]),
+            Preset::TrimOut => Self::from(&[Pt::new(0.0, 1.0, 0.0), Pt::new(0.88, 1.0, 0.3), Pt::new(1.0, 0.0, 0.0)]),
+            Preset::TapeStart => Self::from(&[Pt::new(0.0, 0.0, 0.35), Pt::new(0.5, 1.0, 0.0), Pt::new(1.0, 1.0, 0.0)]),
             Preset::Duck8 => {
                 let mut w = Self::flat(1.0);
                 for k in 0..8 {

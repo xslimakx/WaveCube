@@ -2,7 +2,7 @@
 
 # WaveCube
 
-Draw a shape and let volume, filter, pan, width, time, noise, crush and drive follow it in time with your song.
+A modular shaper: build a chain of up to 12 items (volume, filter, pan, width, time, noise, crush, drive, reverb, liquid, compressor, scope), draw their shapes, and let them move in time with your song.
 
 [![Build](https://github.com/xslimakx/WaveCube/actions/workflows/build.yml/badge.svg)](https://github.com/xslimakx/WaveCube/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -17,75 +17,75 @@ Draw a shape and let volume, filter, pan, width, time, noise, crush and drive fo
 
 <p align="center"><img src="docs/img/wavecube.png" alt="WaveCube" width="880"></p>
 
-Up to eight shapers in one chain: add the ones you need with **+**, remove them with **×**, drag the tabs to change the order. Each one has its own drawn LFO shape, its own timing, an envelope follower (Volume: a compressor) and, if you want, three bands with a shape and settings for each. Sidechain pumping without a sidechain, gates, wobbles, phasers, auto-pan, Haas swirls, mono bass, tape stops, half-time, scratches, risers, vinyl, bit crush and fold distortion.
+## The chain
 
-## Shapers
+- **Up to 12 items, any kind, any order, the same kind as often as you like** (two Drives, three Volumes...). **+** adds one (Shift: right after the selected one), drag a tile to move it, **×** removes it, the dot switches it on / off.
+- **Right-click a tile**: Duplicate, Replace with another kind, Add after, Copy / Paste item, Reset, Remove.
+- Every item has its own **presets** (factory and your own), its **Mix**, and **Multiband**: three bands with their own shapes, LFO, envelope, mix and solo; splits dragged in the band picture, 6 / 12 / 24 dB, the bands always add up flat.
 
-| | Top / bottom of the shape | Controls |
+<p align="center"><img src="docs/img/wavecube-chain.png" alt="Chain" width="440"> <img src="docs/img/wavecube-multiband.png" alt="Multiband" width="440"></p>
+
+| Item | Shapes (lanes) | Settings |
 |---|---|---|
-| **Volume** | full / silent | Amount, Trim; **compressor**: Threshold, Ratio (to ∞:1), Attack, Hold, Release, Makeup + Auto |
-| **Filter** | High / Low cutoff | LP / HP 6, 12, 24 dB, BP, Notch, Peak, **phasers** with 2-8 notches or peaks; Low, High, Resonance, Stereo (±60 st) |
-| **Pan** | left / right | Balance 0 / 3 / 4.5 / 6 dB or Combined, Pan / Haas blend, Haas range 0-40 ms |
-| **Width** | twice as wide / mono | Amount, Gain |
-| **Time** | now / late | Range: one cycle, 1-8 bars, or 2.5 / 10 / 20 ms; slopes bend the pitch |
-| **Noise** | loud / off | White, Pink, Brown, Vinyl crackle, Digital, Mains hum, Air, Tape hiss; High-pass, Low-pass, Stereo, Follow / Duck, Noise only |
-| **Crush** | crushed / clean | Crunch (wave wrap), Push, Bits (16-1), Dither, Resample (44.1 kHz - 8.8 Hz), Jitter, Anti-alias, Low-pass, Gain |
-| **Drive** | driven / clean | 10 styles (soft / hard clip, square, rectify, skew / sine / triangle / extreme fold), Input, Output, Push, Grip, Accent, Tone |
+| **Volume** | Volume | Trim |
+| **Filter** | Cutoff, Resonance | Low-pass, High-pass, Band-pass, Notch, Peak; 6 / 12 / 24 dB; Clean or Warm (Dist, Safe res, Hard dist); Stereo ±60 st; Output; live response curve |
+| **Pan** | Pan | Balance 0 / 3 / 4.5 / 6 dB or Combined; Pan / Haas blend, Haas range; vectorscope |
+| **Width** | Width (mono … twice as wide) | Gain; vectorscope |
+| **Time** | Time position | Range: one cycle, 1 / 2 / 4 / 8 bars, 2.5 / 10 / 20 ms; jumps **cut** (clean cross-fade) or **glide** (scratch) |
+| **Noise** | Volume, Pitch (±24 st) | 24 noises (colours, rain, wind, ocean, fire, tape, vinyl, hum, radio, cymbals, shaker, snare wires…) **+ your own WAV files**; HP, LP, Stereo, Mono, Follow / Duck, Noise only |
+| **Crush** | Bits, Resample | Crunch (wave wrap), Push, Jitter, Treble, Gain, Dither, Anti-alias |
+| **Drive** | Drive | 12 styles (soft / smooth / hard clip, squares, rectifiers, skew / sine / triangle / saw / extreme fold); Input, Output, Push, Grip, Accent, Tone; transfer curve |
+| **Reverb** | Send, Volume | 14 spaces (halls, rooms, chamber, plates, cathedral, endless, shimmer, modulated, spring, metal tank, gated) **+ your own impulse responses**; Pre-delay, Decay, Size, Width, Tone, Dry, Wet; Gated, Clear tails |
+| **Liquid** | Centre, Feedback | Flanger or phaser (2-8 stages), Negative; Stereo, Spread |
+| **Compressor** (tool) | – | Threshold, Ratio (to ∞:1), Attack, Hold, Release, Makeup, Auto gain, Adaptive; listens to its band, the full input with filters, or the sidechain; multiband; gain reduction graph and curve |
+| **Scope** (tool) | – | The signal at that point of the chain, synced to the tempo, L / R split |
 
-Every shaper: **on / off** (the dot on its tab), **Mix**, **Smooth**, **Multiband** (two splits, a shape per band, **S** = solo), **Quick presets** (Init + three ready setups). Filter, Pan, Width, Noise, Crush and Drive have an **envelope follower** (Amount ±200 %, Attack, Hold, Release, Threshold; Filter / Width: Add or Multiply) that can listen to the signal or to the **sidechain input (SC)**; the Volume compressor can be keyed by the sidechain too (kick ducking without a separate plugin).
+<p align="center"><img src="docs/img/wavecube-tools.png" alt="Compressor" width="880"></p>
 
-Switching, adding or removing a shaper and loading presets fade over 8 ms, and Amount, Mix and the gains are smoothed: no clicks.
+## Shapes
 
-## The shape editor
+- **Lanes**: items with two parameters have two shapes. Click a lane to edit it, **drag it up / down to offset** the whole shape (automatable).
+- **Pointer** (points, bend rings), **Select** (box-select, move together, delete), **Pens**: Step, Ramp up / down, Arc, S-curve, Triangle.
+- **Shapes** menu by category for each kind, **Invert, Reverse, ×2, ×3, Random** (Shift: keep the points), **◀ ▶**, **Clear, Copy / Paste** (between lanes, bands and items), **To all bands**.
+- **Grid** 1/4 … 1/64 with triplets, **Snap** (Shift toggles), position read-out.
+- Behind the shape: the item's input and output over one cycle (or output only, or off), **Freeze**.
+- **Custom waves**: nine slots; **MIDI Switch** loads them while playing with notes C# … A, C triggers.
+- **Undo / Redo** of everything (chain, settings, shapes): ↶ ↷ or Ctrl+Z / Ctrl+Shift+Z.
 
-- **Pointer**: drag points; drag on empty space or double-click for a new one; double-click / right-click deletes; drag the small rings to bend a segment.
-- **Pens**: Step, Ramp up, Ramp down, Arc, S-curve, Triangle: click or drag over the grid cells, the height is where you click.
-- **Shapes** menu (20 shapes), **Invert**, **Reverse**, **×2**, **×3**, **Random** (Shift: keep the points), **◀ ▶** move by a grid step, **Clear**, **Copy / Paste** between shapers and bands, **Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z).
-- **Grid** 1/4 … 1/64 and triplet grids, **Snap** (Shift toggles it while dragging). The pointer position is shown in steps and %.
-- Behind the shape: one cycle of the audio, input dark and output light; **Freeze** holds it.
-- **User waves**: nine slots. Click an empty slot to store the shape, click a full one to load it back (Shift-click: overwrite, right-click: clear). With **MIDI Switch** on, MIDI notes C# to A load the slots into their shapers while playing; only C notes restart the LFOs then.
+## LFO (per lane, per band)
 
-<p align="center"><img src="docs/img/wavecube-multiband.png" alt="Multiband" width="440"> <img src="docs/img/wavecube-time.png" alt="Time" width="440"></p>
+**Beat** (song position; 32 bars … 1/128, straight / dotted / triplet), **Hz** (0.02 Hz … 5 kHz) or **Pitch** (the MIDI note, ±36 st). **Sync**, **MIDI** or **Audio** trigger (input or sidechain; Drums / General / Complex, threshold, sensitivity, shift, filters in ⚙). **Loop** or **1-shot** with a draggable END marker. **Phase, Smooth, Swing, Stereo** (right channel offset). In multiband the bands are linked (shared timing) or free. **→ other lane** copies the settings.
 
-## LFO
+## Envelope follower (per lane, per band)
 
-**Mode**: Beat (tempo and song position), Hz (0.02 Hz - 5 kHz), Pitch (speed = the MIDI note played). **Trigger**: Free, MIDI, MIDI 1-shot, Audio, Audio 1-shot (1-shot plays once and holds the end). **Length** 1/128 to 32 bars, straight / dotted / triplet, **Phase**.
+Listens to the band, the full input through its own HP / LP, or the **sidechain**. Amount ±200 %, Depth ×1 … ×8, Threshold, Attack, Hold, Release, Shift, Adaptive release, Add or Multiply, **Listen** to the detector, level graph.
 
-Extras: **Swing** delays every second grid step (groove for gates and steps). **Stereo** offsets the right channel's position in the shape by up to 180° (stereo tremolo, wide wobbles, ping-pong gates; Volume, Filter, Time, Noise, Crush, Drive); the editor shows the right channel's playhead as a hollow dot.
-
-<p align="center"><img src="docs/img/wavecube-stereo.png" alt="Stereo wobble" width="880"></p>
+<p align="center"><img src="docs/img/wavecube-time.png" alt="Time" width="880"></p>
 
 ## Presets
 
-Click the preset name for the browser: search, All / Favourites / Factory / User and nine categories, the shapers each preset uses, ★ to mark favourites, ✕ to delete your own. **◀ ▶** step through the current list, **SAVE** stores the whole plugin (every control, all shapes, user waves, the chain). **A / B** keeps two complete settings to compare (Shift-click copies the current one into a slot). 42 factory presets. ⚙: window size 75-200 %, open the preset folder. User presets are JSON files in:
+**136 factory presets** in Sidechain, Rhythmic, Motion, Color, Pitch & Time, Space, Mixing and Sound Design, plus 64 item presets. Browser with search, favourites, categories and a **Uses** filter (presets with a Reverb, a Compressor…), the chain of each preset as coloured tags, **◀ ▶**, **⚄** random preset, **A / B**, SAVE (everything) and item presets (one item). ⚙ also opens the folders.
 
-| OS | Folder |
-|---|---|
-| Linux | `~/.local/share/WaveCube/Presets` |
-| Windows | `%APPDATA%\WaveCube\Presets` |
-| macOS | `~/Library/Application Support/WaveCube/Presets` |
+<p align="center"><img src="docs/img/wavecube-presets.png" alt="Presets" width="440"> <img src="docs/img/wavecube-settings.png" alt="Settings" width="440"></p>
 
-<p align="center"><img src="docs/img/wavecube-presets.png" alt="Presets" width="880"></p>
+| OS | Presets | Your noises / IRs |
+|---|---|---|
+| Linux | `~/.local/share/WaveCube/Presets` | `~/.local/share/WaveCube/Noises`, `…/IRs` |
+| Windows | `%APPDATA%\WaveCube\Presets` | `%APPDATA%\WaveCube\Noises`, `…\IRs` |
+| macOS | `~/Library/Application Support/WaveCube/Presets` | `…/WaveCube/Noises`, `…/IRs` |
 
-**Output**: Input, Master mix, Output, and **Clip**, a safety clipper that is transparent below -1 dBFS and never lets the plugin go over 0 dBFS (on by default).
+## Sound
 
-## How it works
-
-```
-input → Input → shaper → shaper → … (your order) → Master mix → Output → Clip
-shaper: LFO (song position / Hz / note pitch; restarted by MIDI or audio hits; 1-shot)
-        → swing, stereo offset → drawn shape (2048-point table) → Smooth → + envelope follower
-        → full band, or Linkwitz-Riley 24 dB/oct split into 3 bands (flat sum, solo)
-        → effect per band → shaper Mix
-```
-
-No latency. The plugin has a stereo sidechain input ("Sidechain") for the envelope followers and the compressor.
+- No latency (a user impulse response adds its own 256 samples to the reverb tail only).
+- **No clicks**: switching items on / off, knobs, mix, offsets, new shapes, and changes of the chain or an item's type, slope or bands are faded; Time jumps cross-fade; delay lines fill before an item is heard.
+- Works the same at 22.05 … 192 kHz and any block size; no DC; safe at any tempo; a safety clipper at the end (⚙).
+- The plugin has a stereo **sidechain** input.
 
 ## Tested
 
-`cargo test -p wavecube` (44 tests): everything off is bit-exact, removed shapers do nothing, neutral shapes are transparent; switching shapers, Amount / Mix / gain changes do not click; Volume follows the shape; the compressor reduces by the ratio and listens to the sidechain; the three bands sum flat within 0.1 dB, solo plays one band; every filter type closes / opens where it should and fast resonant sweeps stay smooth; the envelope opens the filter; Time delays by exactly the drawn amount, stays clean at delays of a few samples and never replays old audio after a restart; Pan and Haas; stereo offset and swing; the safety clipper; every noise type; every drive style stays bounded; MIDI restarts, 1-shot holds, Pitch mode runs at the note, MIDI Switch loads user waves; Beat mode lands on the song position; all factory and quick presets are valid and survive a save / load; fuzzing every mode at extreme settings never blows up.
+`cargo test -p wavecube` (64 tests), including: every factory preset at 22.05 / 44.1 / 48 / 96 / 192 kHz (same level everywhere, finite, bounded), block sizes 1 … 2048 sound the same, no clicks on any kind of change for every item, silence after music stays cheap (no denormals) and dies away, tempo 20 … 999 BPM with the song position jumping, Hz and pitch at the ends of their ranges, no DC, mono hosts, Time reaches 16 s back, 1-shot holds cleanly in sync, bands sum flat at every slope, every filter / drive / noise / reverb type, the triggers and MIDI Switch, fuzzing everything at once.
 
-CPU (one core, 48 kHz): a single shaper about 0.3 %; all 8 shapers × 3 bands with envelopes, stereo offset, swing, an 8-notch phaser and Haas on: about 11 %.
+CPU (one core, 48 kHz): one Volume about 0.3 %; 12 items × 3 bands with envelopes on about 25-30 %.
 
 ## Installation
 

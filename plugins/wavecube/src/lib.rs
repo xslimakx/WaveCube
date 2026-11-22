@@ -1,364 +1,362 @@
-//! WaveCube - multi-shaper LFO effect (VST3).
+//! WaveCube - modular shaper effect (VST3).
 //!
-//! Eight shapers in a chain you can reorder: Volume, Filter, Pan, Width, Time, Noise, Crush and
-//! Drive. Every shaper is driven by its own drawn shape (points with curves and steps) and, for
-//! most of them, an envelope follower; Volume has a compressor. Shapes run in time with the
-//! song, free in Hz, at the pitch of MIDI notes, and can be restarted by MIDI notes or by hits
-//! of the audio. Every shaper can split the signal into three bands with settings of their own.
+//! A chain of up to 12 items, any order, any type, duplicates allowed: Volume, Filter, Pan, Width,
+//! Time, Noise, Crush, Drive, Reverb and Liquid shapers, plus Compressor and Scope tools. A shaper
+//! has one or two modulated parameters ("lanes"), each with a drawn shape, its own LFO settings
+//! and envelope follower, per band in multiband mode.
 
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub mod dsp;
+pub mod kinds;
 pub mod presets;
 pub mod wave;
 mod editor;
 
-use wave::{Preset, Pt, Wave};
+pub use kinds::Kind;
+use wave::Wave;
 
-pub const N_SHAPERS: usize = 8;
+/// chain slots
+pub const N_SLOTS: usize = 12;
+pub const N_LANES: usize = 2;
 pub const N_BANDS: usize = 3;
-pub const N_SLOTS: usize = 9;
+pub const N_CUSTOM: usize = 9;
+/// generic knobs per slot (their meaning depends on the slot's kind)
+pub const N_KNOBS: usize = 10;
 
 // ------------------------------------------------------------------------------------------
-// Shaper kinds
+// Settings that are saved with the project (not host-automatable)
 // ------------------------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    Volume,
-    Filter,
-    Pan,
-    Width,
-    Time,
-    Noise,
-    Crush,
-    Drive,
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Lfo {
+    /// 0 beat, 1 Hz, 2 pitch
+    pub mode: u8,
+    /// index into kinds::LENGTHS
+    pub length: u8,
+    pub feel: u8,
+    pub hz: f32,
+    /// pitch mode: transpose in semitones (±36)
+    pub transpose: f32,
+    /// 0 sync, 1 MIDI, 2 audio
+    pub trigger: u8,
+    /// off: 1-shot, stops at `end`
+    pub looping: bool,
+    pub end: f32,
+    pub phase: f32,
+    pub smooth: f32,
+    pub swing: f32,
+    /// right channel offset, degrees
+    pub spread: f32,
 }
 
-impl Kind {
-    pub const ALL: [Kind; N_SHAPERS] = [Kind::Volume, Kind::Filter, Kind::Pan, Kind::Width, Kind::Time, Kind::Noise, Kind::Crush, Kind::Drive];
+impl Default for Lfo {
+    fn default() -> Self {
+        Self { mode: 0, length: 5, feel: 0, hz: 1.0, transpose: 0.0, trigger: 0, looping: true, end: 1.0, phase: 0.0, smooth: 1.5, swing: 0.0, spread: 0.0 }
+    }
+}
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Kind::Volume => "Volume",
-            Kind::Filter => "Filter",
-            Kind::Pan => "Pan",
-            Kind::Width => "Width",
-            Kind::Time => "Time",
-            Kind::Noise => "Noise",
-            Kind::Crush => "Crush",
-            Kind::Drive => "Drive",
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Env {
+    pub on: bool,
+    /// -2 .. 2
+    pub amount: f32,
+    /// 0: ×1, 1: ×2, 2: ×4, 3: ×8
+    pub depth: u8,
+    pub attack: f32,
+    pub hold: f32,
+    pub release: f32,
+    pub adaptive: bool,
+    pub thresh: f32,
+    /// -1 .. 1: moves the resting point
+    pub shift: f32,
+    pub multiply: bool,
+    /// 0 band, 1 free (own filters), 2 sidechain
+    pub input: u8,
+    pub hp: f32,
+    pub lp: f32,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self { on: false, amount: 1.0, depth: 0, attack: 5.0, hold: 0.0, release: 150.0, adaptive: false, thresh: -40.0, shift: 0.0, multiply: false, input: 0, hp: 20.0, lp: 20000.0 }
+    }
+}
+
+/// Everything about a slot that is not a wave and not automatable. Plain data (Copy) so the
+/// audio thread can take a snapshot without allocating.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct SlotSet {
+    pub kind: Kind,
+    pub multiband: bool,
+    pub x_lo: f32,
+    pub x_hi: f32,
+    /// band split slope: 0 6 dB, 1 12 dB, 2 24 dB
+    pub slope: u8,
+    pub lfo: [[Lfo; N_BANDS]; N_LANES],
+    pub link: [bool; N_LANES],
+    pub env: [[Env; N_BANDS]; N_LANES],
+    // filter
+    pub f_type: u8,
+    pub f_warm: bool,
+    pub f_slope: u8,
+    pub f_safe: bool,
+    pub f_hard: bool,
+    // drive
+    pub d_style: u8,
+    // noise: < 1000 built-in, >= 1000 user file
+    pub n_type: u16,
+    pub n_mono: bool,
+    pub n_only: bool,
+    pub n_env: u8,
+    // reverb: < 1000 built-in, >= 1000 user IR
+    pub r_type: u16,
+    pub r_gated: bool,
+    pub r_clear: bool,
+    // liquid
+    pub l_type: u8,
+    pub l_neg: bool,
+    pub l_stages: u8,
+    // pan / time / crush / compressor / scope
+    pub p_law: u8,
+    pub t_range: u8,
+    pub t_instant: bool,
+    pub c_dither: bool,
+    pub c_prefilter: bool,
+    pub comp_auto: bool,
+    pub comp_adaptive: bool,
+    pub comp_input: u8,
+    pub scope_len: u8,
+    pub scope_split: bool,
+}
+
+impl Default for SlotSet {
+    fn default() -> Self {
+        Self::new(Kind::Volume)
+    }
+}
+
+impl SlotSet {
+    pub fn new(kind: Kind) -> Self {
+        let mut lfo = Lfo { length: kind.default_length(), ..Lfo::default() };
+        if kind == Kind::Time {
+            lfo.smooth = 4.0;
+        }
+        Self {
+            kind,
+            multiband: false,
+            x_lo: 200.0,
+            x_hi: 2500.0,
+            slope: 2,
+            lfo: [[lfo; N_BANDS]; N_LANES],
+            link: [true; N_LANES],
+            env: [[Env::default(); N_BANDS]; N_LANES],
+            f_type: 0,
+            f_warm: false,
+            f_slope: 1,
+            f_safe: true,
+            f_hard: false,
+            d_style: 0,
+            n_type: 0,
+            n_mono: false,
+            n_only: false,
+            n_env: 0,
+            r_type: 5,
+            r_gated: false,
+            r_clear: false,
+            l_type: 2,
+            l_neg: false,
+            l_stages: 1,
+            p_law: 1,
+            t_range: 0,
+            t_instant: true,
+            c_dither: false,
+            c_prefilter: true,
+            comp_auto: true,
+            comp_adaptive: false,
+            comp_input: 0,
+            scope_len: 5,
+            scope_split: false,
         }
     }
 
-    pub fn index(self) -> usize {
-        Kind::ALL.iter().position(|&k| k == self).unwrap_or(0)
-    }
-
-    /// What the top and the bottom of the editor mean.
-    pub fn axis(self) -> (&'static str, &'static str) {
-        match self {
-            Kind::Volume => ("FULL", "SILENT"),
-            Kind::Filter => ("OPEN", "CLOSED"),
-            Kind::Pan => ("LEFT", "RIGHT"),
-            Kind::Width => ("WIDE", "MONO"),
-            Kind::Time => ("NOW", "LATE"),
-            Kind::Noise => ("LOUD", "OFF"),
-            Kind::Crush => ("CRUSHED", "CLEAN"),
-            Kind::Drive => ("DRIVEN", "CLEAN"),
-        }
-    }
-
-    pub fn about(self) -> &'static str {
-        match self {
-            Kind::Volume => "The shape is the level: sidechain pumping, gates, tremolo. Plus a compressor.",
-            Kind::Filter => "The shape moves the cutoff between Low and High.",
-            Kind::Pan => "The shape moves the sound between left (top) and right (bottom).",
-            Kind::Width => "Top: twice as wide, middle: as is, bottom: mono.",
-            Kind::Time => "Lower = later. Slopes bend the pitch: tape stops, half-time, scratches.",
-            Kind::Noise => "Adds noise shaped by the line: risers, hats, air, vinyl.",
-            Kind::Crush => "The shape blends in the crush chain: crunch, bits, resample.",
-            Kind::Drive => "Saturation follows the shape: from clean to driven.",
-        }
-    }
-
-    pub fn has_envelope(self) -> bool {
-        !matches!(self, Kind::Volume | Kind::Time)
-    }
-
-    pub fn default_wave(self) -> Wave {
-        match self {
-            Kind::Volume => Wave::preset(Preset::Pump),
-            Kind::Filter => Wave::from(&[Pt::new(0.0, 0.25, -0.4), Pt::new(0.5, 1.0, 0.4), Pt::new(1.0, 0.25, 0.0)]),
-            Kind::Pan => Wave::preset(Preset::Sine),
-            Kind::Width => Wave::from(&[Pt::new(0.0, 0.5, 0.0), Pt::new(0.5, 1.0, 0.0), Pt::new(1.0, 0.5, 0.0)]),
-            Kind::Time => Wave::preset(Preset::TapeStop),
-            Kind::Noise => Wave::from(&[Pt::new(0.0, 0.0, 0.5), Pt::new(1.0, 1.0, 0.0)]),
-            Kind::Crush => Wave::preset(Preset::Square),
-            Kind::Drive => Wave::from(&[Pt::new(0.0, 1.0, 0.45), Pt::new(1.0, 0.0, 0.0)]),
-        }
-    }
-
-    pub fn default_rate(self) -> Rate {
-        match self {
-            Kind::Volume => Rate::Quarter,
-            Kind::Filter | Kind::Noise => Rate::Bar1,
-            Kind::Pan | Kind::Width => Rate::Half,
-            Kind::Time => Rate::Bar1,
-            Kind::Crush => Rate::Eighth,
-            Kind::Drive => Rate::Quarter,
-        }
-    }
-}
-
-// ------------------------------------------------------------------------------------------
-// Enums shown in the host / GUI
-// ------------------------------------------------------------------------------------------
-
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum Mode {
-    /// tempo and song position
-    #[name = "Beat"]
-    Beat,
-    /// free running, in Hz
-    #[name = "Hz"]
-    Hz,
-    /// speed = frequency of the last MIDI note
-    #[name = "Pitch"]
-    Pitch,
-}
-
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum Trigger {
-    #[name = "Free"]
-    Off,
-    #[name = "MIDI"]
-    Midi,
-    #[name = "MIDI 1-shot"]
-    MidiOnce,
-    #[name = "Audio"]
-    Audio,
-    #[name = "Audio 1-shot"]
-    AudioOnce,
-}
-
-impl Trigger {
-    pub fn midi(self) -> bool {
-        matches!(self, Trigger::Midi | Trigger::MidiOnce)
-    }
-    pub fn audio(self) -> bool {
-        matches!(self, Trigger::Audio | Trigger::AudioOnce)
-    }
-    pub fn once(self) -> bool {
-        matches!(self, Trigger::MidiOnce | Trigger::AudioOnce)
-    }
-}
-
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum Rate {
-    #[name = "32 bars"]
-    Bar32,
-    #[name = "16 bars"]
-    Bar16,
-    #[name = "8 bars"]
-    Bar8,
-    #[name = "4 bars"]
-    Bar4,
-    #[name = "2 bars"]
-    Bar2,
-    #[name = "1 bar"]
-    Bar1,
-    #[name = "1/2"]
-    Half,
-    #[name = "1/4"]
-    Quarter,
-    #[name = "1/8"]
-    Eighth,
-    #[name = "1/16"]
-    Sixteenth,
-    #[name = "1/32"]
-    ThirtySecond,
-    #[name = "1/64"]
-    SixtyFourth,
-    #[name = "1/128"]
-    OneTwentyEighth,
-}
-
-impl Rate {
-    /// length of one cycle in quarter notes
-    pub fn beats(self) -> f64 {
-        4.0 * 2f64.powi(5 - self.to_index() as i32)
-    }
-}
-
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum Feel {
-    #[name = "Straight"]
-    Straight,
-    #[name = "Dotted"]
-    Dotted,
-    #[name = "Triplet"]
-    Triplet,
-}
-
-impl Feel {
-    pub fn factor(self) -> f64 {
-        match self {
-            Feel::Straight => 1.0,
-            Feel::Dotted => 1.5,
-            Feel::Triplet => 2.0 / 3.0,
+    /// The LFO settings a band really uses (linked bands follow the mid band, like the host
+    /// automation does).
+    pub fn lfo_of(&self, lane: usize, band: usize) -> Lfo {
+        let l = self.lfo[lane][band];
+        if self.link[lane] && self.multiband {
+            let m = self.lfo[lane][1];
+            Lfo { mode: m.mode, length: m.length, feel: m.feel, hz: m.hz, transpose: m.transpose, trigger: m.trigger, looping: m.looping, ..l }
+        } else if !self.multiband {
+            self.lfo[lane][0]
+        } else {
+            l
         }
     }
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum FilterType {
-    #[name = "LP 6"]
-    Lp6,
-    #[name = "HP 6"]
-    Hp6,
-    #[name = "LP 12"]
-    Lp12,
-    #[name = "HP 12"]
-    Hp12,
-    #[name = "BP 12"]
-    Bp12,
-    #[name = "Notch 12"]
-    Notch12,
-    #[name = "Peak 12"]
-    Peak12,
-    #[name = "LP 24"]
-    Lp24,
-    #[name = "HP 24"]
-    Hp24,
-    #[name = "BP 24"]
-    Bp24,
-    #[name = "Notch 24"]
-    Notch24,
-    #[name = "Peak 24"]
-    Peak24,
-    #[name = "Phaser 2 notches"]
-    PhN2,
-    #[name = "Phaser 4 notches"]
-    PhN4,
-    #[name = "Phaser 6 notches"]
-    PhN6,
-    #[name = "Phaser 8 notches"]
-    PhN8,
-    #[name = "Phaser 2 peaks"]
-    PhP2,
-    #[name = "Phaser 4 peaks"]
-    PhP4,
-    #[name = "Phaser 6 peaks"]
-    PhP6,
-    #[name = "Phaser 8 peaks"]
-    PhP8,
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct AudioTrig {
+    pub sidechain: bool,
+    pub hp: f32,
+    pub lp: f32,
+    /// 0 drums, 1 general, 2 complex
+    pub algo: u8,
+    /// sensitivity 0..1
+    pub detail: f32,
+    /// delay of the trigger, 0..4 ms
+    pub shift: f32,
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum DriveStyle {
-    #[name = "Soft clip"]
-    SoftClip,
-    #[name = "Hard clip"]
-    HardClip,
-    #[name = "Soft square"]
-    SoftSquare,
-    #[name = "Hard square"]
-    HardSquare,
-    #[name = "Soft rectify"]
-    SoftRectify,
-    #[name = "Hard rectify"]
-    HardRectify,
-    #[name = "Skew fold"]
-    SkewFold,
-    #[name = "Sine fold"]
-    SineFold,
-    #[name = "Triangle fold"]
-    TriFold,
-    #[name = "Extreme fold"]
-    ExtremeFold,
+impl Default for AudioTrig {
+    fn default() -> Self {
+        Self { sidechain: false, hp: 20.0, lp: 20000.0, algo: 0, detail: 0.5, shift: 0.0 }
+    }
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum NoiseType {
-    #[name = "White"]
-    White,
-    #[name = "Pink"]
-    Pink,
-    #[name = "Brown"]
-    Brown,
-    #[name = "Vinyl crackle"]
-    Crackle,
-    #[name = "Digital"]
-    Digital,
-    #[name = "Mains hum"]
-    Hum,
-    #[name = "Air"]
-    Air,
-    #[name = "Tape hiss"]
-    Tape,
+/// A custom wave slot: a shape and where it came from.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Custom {
+    pub slot: u8,
+    pub lane: u8,
+    pub band: u8,
+    pub kind: Kind,
+    pub wave: Wave,
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum NoiseEnv {
-    #[name = "Off"]
-    Off,
-    #[name = "Follow"]
-    Follow,
-    #[name = "Duck"]
-    Duck,
+/// Saved with the project / preset.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct State {
+    /// the chain: slot indices in processing order
+    pub chain: Vec<u8>,
+    pub slots: Vec<SlotSet>,
+    /// waves[slot][lane][band]
+    pub waves: Vec<Vec<Vec<Wave>>>,
+    pub custom: Vec<Option<Custom>>,
+    pub trig: AudioTrig,
+    /// 0 = all
+    pub midi_channel: u8,
+    pub preset: String,
+    pub selected: u8,
+    pub lane: u8,
+    pub band: u8,
+    pub grid: u8,
+    pub scope_mode: u8,
+    /// user noise / IR file names (index = n_type / r_type - 1000)
+    pub user_noises: Vec<String>,
+    pub user_irs: Vec<String>,
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum PanMode {
-    #[name = "Balance 0 dB"]
-    Bal0,
-    #[name = "Balance 3 dB"]
-    Bal3,
-    #[name = "Balance 4.5 dB"]
-    Bal45,
-    #[name = "Balance 6 dB"]
-    Bal6,
-    #[name = "Combined"]
-    Combined,
+impl Default for State {
+    fn default() -> Self {
+        let mut st = Self {
+            chain: vec![],
+            slots: vec![SlotSet::default(); N_SLOTS],
+            waves: vec![],
+            custom: vec![None; N_CUSTOM],
+            trig: AudioTrig::default(),
+            midi_channel: 0,
+            preset: "Init".into(),
+            selected: 0,
+            lane: 0,
+            band: 0,
+            grid: 16,
+            scope_mode: 0,
+            user_noises: vec![],
+            user_irs: vec![],
+        };
+        st.sanitize();
+        st.put(0, Kind::Volume);
+        st.chain = vec![0];
+        st
+    }
 }
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum TimeRange {
-    #[name = "Cycle"]
-    Cycle,
-    #[name = "1 bar"]
-    Bar1,
-    #[name = "2 bars"]
-    Bar2,
-    #[name = "4 bars"]
-    Bar4,
-    #[name = "8 bars"]
-    Bar8,
-    #[name = "2.5 ms"]
-    Ms2,
-    #[name = "10 ms"]
-    Ms10,
-    #[name = "20 ms"]
-    Ms20,
-}
+pub const GRIDS: [u8; 7] = [4, 8, 12, 16, 24, 32, 64];
 
-#[derive(Enum, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum EnvMode {
-    #[name = "Add"]
-    Add,
-    #[name = "Multiply"]
-    Multiply,
+impl State {
+    /// An empty chain.
+    pub fn empty() -> Self {
+        let mut s = Self::default();
+        s.chain.clear();
+        s
+    }
+
+    /// Sets a slot to a fresh shaper of `kind` (settings and shapes; not the chain).
+    pub fn put(&mut self, slot: usize, kind: Kind) {
+        self.slots[slot] = SlotSet::new(kind);
+        self.waves[slot] = (0..N_LANES).map(|l| vec![kind.default_wave(l); N_BANDS]).collect();
+    }
+
+    /// First slot not in the chain.
+    pub fn free_slot(&self) -> Option<usize> {
+        (0..N_SLOTS).find(|s| !self.chain.contains(&(*s as u8)))
+    }
+
+    /// Repairs a state from an older / damaged save.
+    pub fn sanitize(&mut self) {
+        self.slots.resize(N_SLOTS, SlotSet::default());
+        self.waves.resize(N_SLOTS, Vec::new());
+        for (s, w) in self.waves.iter_mut().enumerate() {
+            let kind = self.slots[s].kind;
+            w.resize(N_LANES, Vec::new());
+            for (l, lane) in w.iter_mut().enumerate() {
+                lane.resize(N_BANDS, kind.default_wave(l));
+                for b in lane.iter_mut() {
+                    b.sanitize();
+                }
+            }
+        }
+        let mut seen = [false; N_SLOTS];
+        self.chain.retain(|&i| (i as usize) < N_SLOTS && !std::mem::replace(&mut seen[i as usize], true));
+        for s in self.slots.iter_mut() {
+            s.x_lo = s.x_lo.clamp(20.0, 20000.0);
+            s.x_hi = s.x_hi.clamp(s.x_lo * 1.1, 20000.0);
+            s.slope = s.slope.min(2);
+            for lane in s.lfo.iter_mut() {
+                for l in lane.iter_mut() {
+                    l.mode = l.mode.min(2);
+                    l.length = l.length.min(12);
+                    l.feel = l.feel.min(2);
+                    l.trigger = l.trigger.min(2);
+                    l.hz = l.hz.clamp(0.02, 5240.0);
+                    l.end = l.end.clamp(0.01, 1.0);
+                }
+            }
+        }
+        self.custom.resize(N_CUSTOM, None);
+        for c in self.custom.iter_mut().flatten() {
+            c.slot = c.slot.min(N_SLOTS as u8 - 1);
+            c.lane = c.lane.min(N_LANES as u8 - 1);
+            c.band = c.band.min(N_BANDS as u8 - 1);
+            c.wave.sanitize();
+        }
+        if !self.chain.contains(&self.selected) {
+            self.selected = self.chain.first().copied().unwrap_or(0);
+        }
+        let k = self.slots[self.selected as usize].kind;
+        self.lane = self.lane.min(k.n_lanes().max(1) as u8 - 1);
+        self.band = self.band.min(N_BANDS as u8 - 1);
+        if !GRIDS.contains(&self.grid) {
+            self.grid = 16;
+        }
+        self.midi_channel = self.midi_channel.min(16);
+    }
 }
 
 // ------------------------------------------------------------------------------------------
-// Parameters
+// Parameters (host-automatable)
 // ------------------------------------------------------------------------------------------
 
 fn lin(min: f32, max: f32) -> FloatRange {
@@ -373,237 +371,134 @@ fn parse_pct() -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
     Arc::new(|s| s.trim().trim_end_matches('%').trim().parse::<f32>().ok().map(|v| v / 100.0))
 }
 
-fn hz_str() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
-    Arc::new(|v| if v >= 1000.0 { format!("{:.1}k", v / 1000.0) } else if v < 10.0 { format!("{:.2}", v) } else { format!("{:.0}", v) })
-}
-
-fn parse_hz() -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
-    Arc::new(|s| {
-        let s = s.trim().to_lowercase();
-        let s = s.trim_end_matches("hz").trim();
-        if let Some(k) = s.strip_suffix('k') {
-            k.trim().parse::<f32>().ok().map(|v| v * 1000.0)
-        } else {
-            s.parse().ok()
-        }
-    })
-}
-
-fn one_dec() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
-    Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0))
-}
-
-fn parse_num(unit: &'static str) -> Arc<dyn Fn(&str) -> Option<f32> + Send + Sync> {
-    Arc::new(move |s| s.trim().trim_end_matches(unit).trim().parse().ok())
-}
-
 fn percent(name: impl Into<String>, def: f32) -> FloatParam {
     FloatParam::new(name, def, lin(0.0, 1.0)).with_unit(" %").with_value_to_string(pct_str()).with_string_to_value(parse_pct())
-}
-
-fn bipercent(name: impl Into<String>, def: f32, max: f32) -> FloatParam {
-    FloatParam::new(name, def, lin(-max, max)).with_unit(" %").with_value_to_string(pct_str()).with_string_to_value(parse_pct())
-}
-
-fn freq(name: impl Into<String>, def: f32, min: f32, max: f32) -> FloatParam {
-    FloatParam::new(name, def, FloatRange::Skewed { min, max, factor: FloatRange::skew_factor(-2.2) })
-        .with_unit(" Hz")
-        .with_value_to_string(hz_str())
-        .with_string_to_value(parse_hz())
-}
-
-fn ms(name: impl Into<String>, def: f32, min: f32, max: f32) -> FloatParam {
-    FloatParam::new(name, def, FloatRange::Skewed { min, max, factor: FloatRange::skew_factor(-1.8) })
-        .with_unit(" ms")
-        .with_value_to_string(Arc::new(|v| if v < 10.0 { format!("{v:.2}") } else if v < 100.0 { format!("{v:.1}") } else { format!("{v:.0}") }))
-        .with_string_to_value(parse_num("ms"))
 }
 
 fn db(name: impl Into<String>, def: f32, min: f32, max: f32) -> FloatParam {
     FloatParam::new(name, def, lin(min, max))
         .with_unit(" dB")
         .with_step_size(0.1)
-        .with_value_to_string(one_dec())
-        .with_string_to_value(parse_num("dB"))
+        .with_value_to_string(Arc::new(|v| format!("{:.1}", (v * 10.0).round() / 10.0 + 0.0)))
+        .with_string_to_value(Arc::new(|s| s.trim().trim_end_matches("dB").trim().parse().ok()))
 }
 
-/// The controls every shaper has.
+/// The kind of every slot, shared with the parameter display (a knob shows its value in the
+/// units of the shaper that is in the slot).
+pub type SlotKinds = Arc<[AtomicU8; N_SLOTS]>;
+
+fn knob_param(slot: usize, k: usize, kinds: &SlotKinds) -> FloatParam {
+    let kd = kinds.clone();
+    let kp = kinds.clone();
+    FloatParam::new(format!("Slot {} Knob {}", slot + 1, k + 1), 0.5, lin(0.0, 1.0))
+        .with_value_to_string(Arc::new(move |n| {
+            let kind = Kind::from_index(kd[slot].load(Ordering::Relaxed) as usize);
+            kind.knobs().get(k).map(|d| d.fmt(n)).unwrap_or_else(|| format!("{:.0} %", n * 100.0))
+        }))
+        .with_string_to_value(Arc::new(move |s| {
+            let kind = Kind::from_index(kp[slot].load(Ordering::Relaxed) as usize);
+            kind.knobs().get(k).and_then(|d| d.parse(s))
+        }))
+}
+
+/// The automatable controls of one chain slot.
 #[derive(Params)]
-pub struct ShaperParams {
+pub struct SlotParams {
     #[id = "on"]
     pub on: BoolParam,
-    #[id = "mode"]
-    pub mode: EnumParam<Mode>,
-    #[id = "trig"]
-    pub trigger: EnumParam<Trigger>,
-    #[id = "rate"]
-    pub rate: EnumParam<Rate>,
-    #[id = "feel"]
-    pub feel: EnumParam<Feel>,
-    #[id = "hz"]
-    pub hz: FloatParam,
-    #[id = "phase"]
-    pub phase: FloatParam,
-    #[id = "amount"]
-    pub amount: FloatParam,
+    /// lane offsets ("tiles"): move the whole shape up / down
+    #[id = "ta"]
+    pub tile_a: FloatParam,
+    #[id = "tb"]
+    pub tile_b: FloatParam,
     #[id = "mix"]
     pub mix: FloatParam,
-    #[id = "smooth"]
-    pub smooth: FloatParam,
-    #[id = "multi"]
-    pub multiband: BoolParam,
-    #[id = "xlo"]
-    pub x_lo: FloatParam,
-    #[id = "xhi"]
-    pub x_hi: FloatParam,
-    // envelope follower
-    #[id = "envon"]
-    pub env_on: BoolParam,
-    #[id = "envamt"]
-    pub env_amt: FloatParam,
-    #[id = "envatt"]
-    pub env_att: FloatParam,
-    #[id = "envhold"]
-    pub env_hold: FloatParam,
-    #[id = "envrel"]
-    pub env_rel: FloatParam,
-    #[id = "envthr"]
-    pub env_thr: FloatParam,
-    #[id = "envmode"]
-    pub env_mode: EnumParam<EnvMode>,
-    #[id = "envsc"]
-    pub env_sc: BoolParam,
-    // groove / stereo
-    #[id = "swing"]
-    pub swing: FloatParam,
-    #[id = "spread"]
-    pub spread: FloatParam,
+    #[id = "mxl"]
+    pub mix_lo: FloatParam,
+    #[id = "mxm"]
+    pub mix_mid: FloatParam,
+    #[id = "mxh"]
+    pub mix_hi: FloatParam,
+    #[id = "k0"]
+    pub k0: FloatParam,
+    #[id = "k1"]
+    pub k1: FloatParam,
+    #[id = "k2"]
+    pub k2: FloatParam,
+    #[id = "k3"]
+    pub k3: FloatParam,
+    #[id = "k4"]
+    pub k4: FloatParam,
+    #[id = "k5"]
+    pub k5: FloatParam,
+    #[id = "k6"]
+    pub k6: FloatParam,
+    #[id = "k7"]
+    pub k7: FloatParam,
+    #[id = "k8"]
+    pub k8: FloatParam,
+    #[id = "k9"]
+    pub k9: FloatParam,
 }
 
-impl ShaperParams {
-    fn new(kind: Kind) -> Self {
-        let n = kind.name();
+impl SlotParams {
+    fn new(slot: usize, kinds: &SlotKinds) -> Self {
+        let n = slot + 1;
+        let tile = |name: String| {
+            FloatParam::new(name, 0.0, lin(-1.0, 1.0))
+                .with_unit(" %")
+                .with_value_to_string(Arc::new(|v| format!("{:+.0}", v * 100.0 + 0.0)))
+                .with_string_to_value(Arc::new(|s| s.trim().trim_end_matches('%').trim().parse::<f32>().ok().map(|v| v / 100.0)))
+        };
         Self {
-            on: BoolParam::new(format!("{n} On"), kind == Kind::Volume),
-            mode: EnumParam::new(format!("{n} LFO Mode"), Mode::Beat),
-            trigger: EnumParam::new(format!("{n} Trigger"), Trigger::Off),
-            rate: EnumParam::new(format!("{n} Length"), kind.default_rate()),
-            feel: EnumParam::new(format!("{n} Feel"), Feel::Straight),
-            hz: FloatParam::new(format!("{n} Speed"), 1.0, FloatRange::Skewed { min: 0.02, max: 5000.0, factor: FloatRange::skew_factor(-2.8) })
-                .with_unit(" Hz")
-                .with_value_to_string(hz_str())
-                .with_string_to_value(parse_hz()),
-            phase: FloatParam::new(format!("{n} Phase"), 0.0, lin(0.0, 360.0))
-                .with_unit("°")
-                .with_step_size(1.0)
-                .with_value_to_string(Arc::new(|v| format!("{:.0}", v)))
-                .with_string_to_value(parse_num("°")),
-            amount: percent(format!("{n} Amount"), 1.0),
-            mix: percent(format!("{n} Mix"), 1.0),
-            smooth: ms(format!("{n} Smooth"), if kind == Kind::Time { 4.0 } else { 1.5 }, 0.0, 100.0),
-            multiband: BoolParam::new(format!("{n} Multiband"), false),
-            x_lo: freq(format!("{n} Low / Mid"), 200.0, 20.0, 20000.0),
-            x_hi: freq(format!("{n} Mid / High"), 2500.0, 20.0, 20000.0),
-            env_on: BoolParam::new(format!("{n} Envelope On"), false),
-            env_amt: bipercent(format!("{n} Envelope Amount"), 1.0, 2.0),
-            env_att: ms(format!("{n} Envelope Attack"), 5.0, 0.1, 500.0),
-            env_hold: ms(format!("{n} Envelope Hold"), 0.0, 0.0, 500.0),
-            env_rel: ms(format!("{n} Envelope Release"), 150.0, 5.0, 2000.0),
-            env_thr: db(format!("{n} Envelope Threshold"), -40.0, -60.0, 0.0),
-            env_mode: EnumParam::new(format!("{n} Envelope Mode"), EnvMode::Add),
-            env_sc: BoolParam::new(format!("{n} Envelope Sidechain"), false),
-            swing: percent(format!("{n} Swing"), 0.0),
-            spread: FloatParam::new(format!("{n} Stereo Phase"), 0.0, lin(0.0, 180.0))
-                .with_unit("°")
-                .with_step_size(1.0)
-                .with_value_to_string(Arc::new(|v| format!("{:.0}", v)))
-                .with_string_to_value(parse_num("°")),
+            on: BoolParam::new(format!("Slot {n} On"), true),
+            tile_a: tile(format!("Slot {n} Offset A")),
+            tile_b: tile(format!("Slot {n} Offset B")),
+            mix: percent(format!("Slot {n} Mix"), 1.0),
+            mix_lo: percent(format!("Slot {n} Mix Low"), 1.0),
+            mix_mid: percent(format!("Slot {n} Mix Mid"), 1.0),
+            mix_hi: percent(format!("Slot {n} Mix High"), 1.0),
+            k0: knob_param(slot, 0, kinds),
+            k1: knob_param(slot, 1, kinds),
+            k2: knob_param(slot, 2, kinds),
+            k3: knob_param(slot, 3, kinds),
+            k4: knob_param(slot, 4, kinds),
+            k5: knob_param(slot, 5, kinds),
+            k6: knob_param(slot, 6, kinds),
+            k7: knob_param(slot, 7, kinds),
+            k8: knob_param(slot, 8, kinds),
+            k9: knob_param(slot, 9, kinds),
         }
     }
-}
 
-/// A user wave slot: a shape and where it came from.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Slot {
-    pub shaper: u8,
-    pub band: u8,
-    pub wave: Wave,
-}
-
-/// Shapes, chain order, user waves and what the editor shows: saved with the project / preset.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct State {
-    /// waves[shaper][band]; band 0 is also the full-band shape
-    pub waves: Vec<Vec<Wave>>,
-    /// chain order: indices into Kind::ALL
-    pub order: Vec<u8>,
-    /// shapers in the chain (the others are removed: not shown, not processed)
-    #[serde(default = "all_present")]
-    pub present: Vec<bool>,
-    #[serde(default)]
-    pub slots: Vec<Option<Slot>>,
-    #[serde(default)]
-    pub preset: String,
-    pub selected: u8,
-    pub band: u8,
-    pub grid: u8,
-}
-
-fn all_present() -> Vec<bool> {
-    vec![true; N_SHAPERS]
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            waves: Kind::ALL.iter().map(|k| vec![k.default_wave(); N_BANDS]).collect(),
-            order: (0..N_SHAPERS as u8).collect(),
-            present: (0..N_SHAPERS).map(|i| i == 0).collect(),
-            slots: vec![None; N_SLOTS],
-            preset: "Init".into(),
-            selected: 0,
-            band: 0,
-            grid: 16,
+    pub fn knob(&self, i: usize) -> &FloatParam {
+        match i {
+            0 => &self.k0,
+            1 => &self.k1,
+            2 => &self.k2,
+            3 => &self.k3,
+            4 => &self.k4,
+            5 => &self.k5,
+            6 => &self.k6,
+            7 => &self.k7,
+            8 => &self.k8,
+            _ => &self.k9,
         }
     }
-}
 
-pub const GRIDS: [u8; 7] = [4, 8, 12, 16, 24, 32, 64];
+    pub fn tile(&self, lane: usize) -> &FloatParam {
+        if lane == 0 {
+            &self.tile_a
+        } else {
+            &self.tile_b
+        }
+    }
 
-impl State {
-    /// Repairs a state from an older / damaged save.
-    pub fn sanitize(&mut self) {
-        let d = State::default();
-        self.waves.resize(N_SHAPERS, Vec::new());
-        for (s, w) in self.waves.iter_mut().enumerate() {
-            w.resize(N_BANDS, d.waves[s][0].clone());
-            for b in w.iter_mut() {
-                b.sanitize();
-            }
-        }
-        let mut seen = [false; N_SHAPERS];
-        self.order.retain(|&i| (i as usize) < N_SHAPERS && !std::mem::replace(&mut seen[i as usize], true));
-        for i in 0..N_SHAPERS {
-            if !seen[i] {
-                self.order.push(i as u8);
-            }
-        }
-        self.present.resize(N_SHAPERS, true);
-        self.slots.resize(N_SLOTS, None);
-        for s in self.slots.iter_mut().flatten() {
-            s.shaper = s.shaper.min(N_SHAPERS as u8 - 1);
-            s.band = s.band.min(N_BANDS as u8 - 1);
-            s.wave.sanitize();
-        }
-        self.selected = self.selected.min(N_SHAPERS as u8 - 1);
-        if !self.present[self.selected as usize] {
-            if let Some(&first) = self.order.iter().find(|&&i| self.present[i as usize]) {
-                self.selected = first;
-            }
-        }
-        self.band = self.band.min(N_BANDS as u8 - 1);
-        if !GRIDS.contains(&self.grid) {
-            self.grid = 16;
+    pub fn band_mix(&self, band: usize) -> &FloatParam {
+        match band {
+            0 => &self.mix_lo,
+            1 => &self.mix_mid,
+            _ => &self.mix_hi,
         }
     }
 }
@@ -612,7 +507,7 @@ impl State {
 pub struct WaveCubeParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
-    #[persist = "shapes"]
+    #[persist = "state2"]
     pub state: Arc<RwLock<State>>,
 
     #[id = "bypass"]
@@ -630,107 +525,16 @@ pub struct WaveCubeParams {
     #[id = "safe"]
     pub safe_clip: BoolParam,
 
-    #[nested(array, group = "Shaper")]
-    pub sh: [ShaperParams; N_SHAPERS],
+    #[nested(array, group = "Slot")]
+    pub slots: [SlotParams; N_SLOTS],
 
-    // ---- Volume
-    #[id = "vtrim"]
-    pub v_trim: FloatParam,
-    #[id = "vcomp"]
-    pub v_comp: BoolParam,
-    #[id = "vthr"]
-    pub v_thr: FloatParam,
-    #[id = "vratio"]
-    pub v_ratio: FloatParam,
-    #[id = "vatt"]
-    pub v_att: FloatParam,
-    #[id = "vhold"]
-    pub v_hold: FloatParam,
-    #[id = "vrel"]
-    pub v_rel: FloatParam,
-    #[id = "vmakeup"]
-    pub v_makeup: FloatParam,
-    #[id = "vauto"]
-    pub v_auto: BoolParam,
-    #[id = "vsc"]
-    pub v_sc: BoolParam,
-    // ---- Filter
-    #[id = "ftype"]
-    pub f_type: EnumParam<FilterType>,
-    #[id = "flo"]
-    pub f_lo: FloatParam,
-    #[id = "fhi"]
-    pub f_hi: FloatParam,
-    #[id = "fres"]
-    pub f_res: FloatParam,
-    #[id = "fstereo"]
-    pub f_stereo: FloatParam,
-    // ---- Pan
-    #[id = "pmode"]
-    pub p_mode: EnumParam<PanMode>,
-    #[id = "phaas"]
-    pub p_haas: FloatParam,
-    #[id = "phaasms"]
-    pub p_haas_ms: FloatParam,
-    // ---- Width
-    #[id = "wgain"]
-    pub w_gain: FloatParam,
-    // ---- Time
-    #[id = "trange"]
-    pub t_range: EnumParam<TimeRange>,
-    // ---- Noise
-    #[id = "ntype"]
-    pub n_type: EnumParam<NoiseType>,
-    #[id = "nhp"]
-    pub n_hp: FloatParam,
-    #[id = "nlp"]
-    pub n_lp: FloatParam,
-    #[id = "nstereo"]
-    pub n_stereo: FloatParam,
-    #[id = "nonly"]
-    pub n_only: BoolParam,
-    #[id = "nenv"]
-    pub n_env: EnumParam<NoiseEnv>,
-    #[id = "nenvamt"]
-    pub n_env_amt: FloatParam,
-    // ---- Crush
-    #[id = "ccrunch"]
-    pub c_crunch: FloatParam,
-    #[id = "cpush"]
-    pub c_push: FloatParam,
-    #[id = "cbits"]
-    pub c_bits: FloatParam,
-    #[id = "cdither"]
-    pub c_dither: BoolParam,
-    #[id = "crate"]
-    pub c_rate: FloatParam,
-    #[id = "cjitter"]
-    pub c_jitter: FloatParam,
-    #[id = "caa"]
-    pub c_aa: BoolParam,
-    #[id = "clp"]
-    pub c_lp: FloatParam,
-    #[id = "cgain"]
-    pub c_gain: FloatParam,
-    // ---- Drive
-    #[id = "dstyle"]
-    pub d_style: EnumParam<DriveStyle>,
-    #[id = "din"]
-    pub d_in: FloatParam,
-    #[id = "dout"]
-    pub d_out: FloatParam,
-    #[id = "dpush"]
-    pub d_push: FloatParam,
-    #[id = "dgrip"]
-    pub d_grip: FloatParam,
-    #[id = "daccent"]
-    pub d_accent: FloatParam,
-    #[id = "dtone"]
-    pub d_tone: FloatParam,
+    /// not a parameter: the kinds the knob displays use
+    pub kinds: SlotKinds,
 }
 
 impl Default for WaveCubeParams {
     fn default() -> Self {
+        let kinds: SlotKinds = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
         Self {
             editor_state: EguiState::from_size(editor::BASE_W as u32, editor::BASE_H as u32),
             state: Arc::new(RwLock::new(State::default())),
@@ -741,67 +545,17 @@ impl Default for WaveCubeParams {
             trig_db: db("Audio Trigger Threshold", -24.0, -60.0, 0.0),
             midi_switch: BoolParam::new("MIDI Switch", false),
             safe_clip: BoolParam::new("Safety Clipper", true),
-            sh: Kind::ALL.map(ShaperParams::new),
+            slots: std::array::from_fn(|i| SlotParams::new(i, &kinds)),
+            kinds,
+        }
+    }
+}
 
-            v_trim: db("Volume Trim", 0.0, -24.0, 24.0),
-            v_comp: BoolParam::new("Compressor On", false),
-            v_thr: db("Compressor Threshold", -18.0, -60.0, 0.0),
-            v_ratio: FloatParam::new("Compressor Ratio", 2.0, FloatRange::Skewed { min: 1.0, max: 100.0, factor: FloatRange::skew_factor(-2.0) })
-                .with_value_to_string(Arc::new(|v| if v >= 99.5 { "∞:1".into() } else { format!("{v:.1}:1") }))
-                .with_string_to_value(Arc::new(|s| s.trim().trim_end_matches(":1").trim().parse().ok())),
-            v_att: ms("Compressor Attack", 10.0, 0.01, 200.0),
-            v_hold: ms("Compressor Hold", 0.0, 0.0, 500.0),
-            v_rel: ms("Compressor Release", 150.0, 50.0, 2000.0),
-            v_makeup: db("Compressor Makeup", 0.0, -12.0, 24.0),
-            v_auto: BoolParam::new("Compressor Auto Makeup", true),
-            v_sc: BoolParam::new("Compressor Sidechain", false),
-
-            f_type: EnumParam::new("Filter Type", FilterType::Lp12),
-            f_lo: freq("Filter Low", 250.0, 20.0, 21000.0),
-            f_hi: freq("Filter High", 18000.0, 20.0, 21000.0),
-            f_res: percent("Filter Resonance", 0.25),
-            f_stereo: FloatParam::new("Filter Stereo", 0.0, lin(-60.0, 60.0))
-                .with_unit(" st")
-                .with_step_size(0.1)
-                .with_value_to_string(one_dec())
-                .with_string_to_value(parse_num("st")),
-
-            p_mode: EnumParam::new("Pan Mode", PanMode::Bal3),
-            p_haas: percent("Pan / Haas", 0.0),
-            p_haas_ms: ms("Haas Range", 2.0, 0.0, 40.0),
-
-            w_gain: db("Width Gain", 0.0, -12.0, 12.0),
-
-            t_range: EnumParam::new("Time Range", TimeRange::Cycle),
-
-            n_type: EnumParam::new("Noise Type", NoiseType::White),
-            n_hp: freq("Noise High-pass", 120.0, 20.0, 20000.0),
-            n_lp: freq("Noise Low-pass", 16000.0, 20.0, 20000.0),
-            n_stereo: percent("Noise Stereo", 1.0),
-            n_only: BoolParam::new("Noise Only", false),
-            n_env: EnumParam::new("Noise Envelope", NoiseEnv::Off),
-            n_env_amt: percent("Noise Envelope Amount", 1.0),
-
-            c_crunch: db("Crush Crunch", 0.0, 0.0, 27.0),
-            c_push: bipercent("Crush Push", 0.0, 1.0),
-            c_bits: FloatParam::new("Crush Bits", 6.0, lin(1.0, 16.0))
-                .with_step_size(0.1)
-                .with_value_to_string(Arc::new(|v| if v > 15.95 { "Max".into() } else { format!("{v:.1}") }))
-                .with_string_to_value(parse_num("bit")),
-            c_dither: BoolParam::new("Crush Dither", false),
-            c_rate: freq("Crush Resample", 6000.0, 8.82, 44100.0),
-            c_jitter: percent("Crush Jitter", 0.0),
-            c_aa: BoolParam::new("Crush Anti-alias", true),
-            c_lp: freq("Crush Low-pass", 20000.0, 200.0, 20000.0),
-            c_gain: db("Crush Gain", 0.0, -24.0, 24.0),
-
-            d_style: EnumParam::new("Drive Style", DriveStyle::SoftClip),
-            d_in: db("Drive Input", 0.0, -12.0, 36.0),
-            d_out: db("Drive Output", 0.0, -36.0, 12.0),
-            d_push: bipercent("Drive Push", 0.0, 1.0),
-            d_grip: percent("Drive Grip", 0.0),
-            d_accent: percent("Drive Accent", 0.0),
-            d_tone: bipercent("Drive Tone", 0.0, 1.0),
+impl WaveCubeParams {
+    /// Keeps the knob displays in step with the slot kinds.
+    pub fn sync_kinds(&self, st: &State) {
+        for (i, s) in st.slots.iter().enumerate() {
+            self.kinds[i].store(s.kind.index() as u8, Ordering::Relaxed);
         }
     }
 }
@@ -810,48 +564,84 @@ impl Default for WaveCubeParams {
 // Shared with the GUI
 // ------------------------------------------------------------------------------------------
 
-/// Bins of the scope behind the editor (one cycle of the shown shaper).
+/// Bins of the scope behind the editor (one cycle of the shown lane).
 pub const SCOPE_N: usize = 256;
+/// Samples of the vectorscope / tool scope ring.
+pub const RING_N: usize = 2048;
 
 pub struct Shared {
-    /// bumped by the GUI after every edit of the shapes / order
-    pub version: AtomicU32,
-    /// shaper the editor shows (the scope follows its cycle)
+    /// bumped by the GUI after every edit of the shapes / custom waves
+    pub wave_version: AtomicU32,
+    /// bumped after every change of the other state (settings, chain)
+    pub set_version: AtomicU32,
+    /// slot / lane / band the editor shows (the scope follows that LFO)
     pub view: AtomicU32,
-    pub phase: [AtomicF32; N_SHAPERS],
-    /// current (smoothed, with the envelope) value of every band of every shaper
-    pub value: [[AtomicF32; N_BANDS]; N_SHAPERS],
-    /// envelope follower (0..1) / compressor gain reduction (dB) per shaper
-    pub env: [AtomicF32; N_SHAPERS],
-    pub gr: AtomicF32,
-    /// solo mask of the bands, per shaper
-    pub solo: [AtomicU32; N_SHAPERS],
-    /// MIDI Switch: (counter << 8) | slot, bumped by the audio thread
+    pub view_lane: AtomicU32,
+    pub view_band: AtomicU32,
+    pub phase: [[AtomicF32; N_LANES]; N_SLOTS],
+    pub value: [[[AtomicF32; N_BANDS]; N_LANES]; N_SLOTS],
+    pub env: [[AtomicF32; N_LANES]; N_SLOTS],
+    pub gr: [AtomicF32; N_SLOTS],
+    pub solo: [AtomicU32; N_SLOTS],
+    /// envelope "solo sidechain" listen: slot + 1 (0 = off)
+    pub env_listen: AtomicU32,
+    /// MIDI Switch: (counter << 8) | custom slot, bumped by the audio thread
     pub switched: AtomicU32,
     pub scope_in: Box<[AtomicF32]>,
     pub scope_out: Box<[AtomicF32]>,
+    /// output of the viewed slot (L, R): vectorscope and the Scope tool
+    pub ring: Mutex<(Vec<[f32; 2]>, usize)>,
     pub in_pk: AtomicF32,
     pub out_pk: AtomicF32,
     pub tempo: AtomicF32,
+    /// loaded user noises / IRs (kept alive here so the audio thread never frees them)
+    pub noises: Mutex<Vec<Arc<dsp::media::Sample>>>,
+    pub irs: Mutex<Vec<Arc<dsp::media::Sample>>>,
+    pub media_version: AtomicU32,
+    /// big buffers (Time, Reverb) made on the GUI thread for the audio thread, and the old ones
+    /// handed back to be freed there
+    pub heavy_in: Mutex<Vec<(usize, Box<dsp::Heavy>)>>,
+    pub heavy_out: Mutex<Vec<Box<dsp::Heavy>>>,
+    pub sr: AtomicF32,
 }
 
 impl Default for Shared {
     fn default() -> Self {
         Self {
-            version: AtomicU32::new(1),
+            wave_version: AtomicU32::new(1),
+            set_version: AtomicU32::new(1),
             view: AtomicU32::new(0),
-            phase: std::array::from_fn(|_| AtomicF32::new(0.0)),
-            value: std::array::from_fn(|_| std::array::from_fn(|_| AtomicF32::new(1.0))),
-            env: std::array::from_fn(|_| AtomicF32::new(0.0)),
-            gr: AtomicF32::new(0.0),
+            view_lane: AtomicU32::new(0),
+            view_band: AtomicU32::new(0),
+            phase: std::array::from_fn(|_| std::array::from_fn(|_| AtomicF32::new(0.0))),
+            value: std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| AtomicF32::new(1.0)))),
+            env: std::array::from_fn(|_| std::array::from_fn(|_| AtomicF32::new(0.0))),
+            gr: std::array::from_fn(|_| AtomicF32::new(0.0)),
             solo: std::array::from_fn(|_| AtomicU32::new(0)),
+            env_listen: AtomicU32::new(0),
             switched: AtomicU32::new(0),
             scope_in: (0..SCOPE_N).map(|_| AtomicF32::new(0.0)).collect(),
             scope_out: (0..SCOPE_N).map(|_| AtomicF32::new(0.0)).collect(),
+            ring: Mutex::new((vec![[0.0; 2]; RING_N], 0)),
             in_pk: AtomicF32::new(0.0),
             out_pk: AtomicF32::new(0.0),
             tempo: AtomicF32::new(120.0),
+            noises: Mutex::new(Vec::new()),
+            irs: Mutex::new(Vec::new()),
+            media_version: AtomicU32::new(0),
+            heavy_in: Mutex::new(Vec::with_capacity(64)),
+            heavy_out: Mutex::new(Vec::with_capacity(64)),
+            sr: AtomicF32::new(48000.0),
         }
+    }
+}
+
+impl Shared {
+    pub fn bump_waves(&self) {
+        self.wave_version.fetch_add(1, Ordering::AcqRel);
+    }
+    pub fn bump_settings(&self) {
+        self.set_version.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -914,9 +704,22 @@ impl Plugin for WaveCube {
 
     fn initialize(&mut self, _layout: &AudioIOLayout, config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
         // also called after a state was loaded: repair it and make the audio thread re-read it
-        self.params.state.write().sanitize();
+        {
+            let mut st = self.params.state.write();
+            st.sanitize();
+            self.params.sync_kinds(&st);
+            dsp::media::load_user_media(&st, &self.shared);
+        }
+        self.shared.sr.store(config.sample_rate, Ordering::Relaxed);
         self.engine = dsp::Engine::new(config.sample_rate);
-        self.shared.version.fetch_add(1, Ordering::AcqRel);
+        {
+            // big buffers for the current chain, made here (not on the audio thread)
+            let st = self.params.state.read();
+            self.engine.prepare(&st, &self.shared);
+        }
+        self.shared.bump_waves();
+        self.shared.bump_settings();
+        self.shared.media_version.fetch_add(1, Ordering::AcqRel);
         true
     }
 
@@ -928,19 +731,14 @@ impl Plugin for WaveCube {
         demo_input(buffer);
         let t = context.transport();
         let transport = dsp::Transport { tempo: t.tempo.unwrap_or(120.0), pos_beats: t.pos_beats(), playing: t.playing };
-        let ep = dsp::Settings::from_params(&self.params);
 
-        // re-read the shapes after an edit (never waits: if the GUI holds the lock, next block)
-        let v = self.shared.version.load(Ordering::Acquire);
-        if v != self.engine.baked_version {
-            if let Some(st) = self.params.state.try_read() {
-                self.engine.bake(&st);
-                self.engine.baked_version = v;
-            }
-        }
+        // snapshots of the state (never waits: if the GUI holds the lock, next block)
+        self.engine.sync(&self.params, &self.shared);
 
         let mut next_event = context.next_event();
-        self.engine.begin_block(&ep, &transport, &self.shared);
+        let ctl = dsp::Controls::from_params(&self.params);
+        self.engine.begin_block(&ctl, &transport, &self.shared);
+        let midi_ch = self.engine.midi_channel();
         let sc_buf = aux.inputs.first().map(|b| b.as_slice_immutable());
         for (i, mut frame) in buffer.iter_samples().enumerate() {
             let sc = match sc_buf {
@@ -956,8 +754,8 @@ impl Plugin for WaveCube {
                 if ev.timing() as usize > i {
                     break;
                 }
-                if let NoteEvent::NoteOn { note: n, velocity, .. } = ev {
-                    if velocity > 0.0 {
+                if let NoteEvent::NoteOn { note: n, velocity, channel, .. } = ev {
+                    if velocity > 0.0 && (midi_ch == 0 || channel + 1 == midi_ch) {
                         note = Some(n);
                     }
                 }
@@ -971,7 +769,7 @@ impl Plugin for WaveCube {
             if nch == 1 {
                 x[1] = x[0];
             }
-            let y = self.engine.process(x, sc, nch == 2, note, &ep, &self.shared);
+            let y = self.engine.process(x, sc, nch == 2, note, &self.shared);
             for (c, s) in frame.iter_mut().enumerate().take(nch) {
                 *s = y[c];
             }
@@ -1038,28 +836,41 @@ mod tests {
         let mut back: State = serde_json::from_str(&s).unwrap();
         back.sanitize();
         assert_eq!(back, st);
-        let mut bad = State { waves: vec![], order: vec![3, 3, 9, 0], present: vec![], slots: vec![], preset: String::new(), selected: 40, band: 9, grid: 7 };
+        let mut bad: State = serde_json::from_str(r#"{"chain":[3,3,40,0],"selected":9,"grid":7}"#).unwrap();
         bad.sanitize();
-        assert_eq!(bad.waves.len(), N_SHAPERS);
-        assert!(bad.waves.iter().all(|w| w.len() == N_BANDS));
+        assert_eq!(bad.chain, vec![3, 0]);
         assert_eq!(bad.slots.len(), N_SLOTS);
-        let mut o = bad.order.clone();
-        o.sort();
-        assert_eq!(o, (0..N_SHAPERS as u8).collect::<Vec<_>>());
-        assert_eq!(bad.order[0], 3);
+        assert!(bad.waves.iter().all(|w| w.len() == N_LANES && w.iter().all(|b| b.len() == N_BANDS)));
+        assert_eq!(bad.selected, 3);
         assert_eq!(bad.grid, 16);
     }
 
     #[test]
-    fn rates_double() {
-        assert_eq!(Rate::Bar1.beats(), 4.0);
-        assert_eq!(Rate::Quarter.beats(), 1.0);
-        assert_eq!(Rate::Bar32.beats(), 128.0);
-        assert_eq!(Rate::OneTwentyEighth.beats(), 1.0 / 32.0);
+    fn duplicates_are_fine() {
+        let mut st = State::empty();
+        for _ in 0..3 {
+            let s = st.free_slot().unwrap();
+            st.put(s, Kind::Drive);
+            st.chain.push(s as u8);
+        }
+        st.sanitize();
+        assert_eq!(st.chain.len(), 3);
+        assert!(st.chain.iter().all(|&s| st.slots[s as usize].kind == Kind::Drive));
     }
 
     #[test]
-    fn param_ids_are_unique_and_stable() {
+    fn knob_params_show_the_slot_kind() {
+        let p = WaveCubeParams::default();
+        p.kinds[2].store(Kind::Filter.index() as u8, Ordering::Relaxed);
+        let s = p.slots[2].k0.normalized_value_to_string(0.75, true);
+        assert!(s.contains("st"), "{s}");
+        p.kinds[2].store(Kind::Compressor.index() as u8, Ordering::Relaxed);
+        let s = p.slots[2].k1.normalized_value_to_string(0.0, true);
+        assert!(s.contains(":1"), "{s}");
+    }
+
+    #[test]
+    fn param_ids_are_unique() {
         let p = WaveCubeParams::default();
         let map = p.param_map();
         let mut ids: Vec<&str> = map.iter().map(|(id, _, _)| id.as_str()).collect();
@@ -1067,17 +878,20 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n);
-        assert!(ids.contains(&"amount_1") && ids.contains(&"envthr_8"));
+        assert!(ids.contains(&"k9_12") && ids.contains(&"ta_1"));
     }
 
     #[test]
-    fn typed_values_parse() {
-        let p = WaveCubeParams::default();
-        let n = p.f_lo.string_to_normalized_value("1.5k").unwrap();
-        assert!((p.f_lo.preview_plain(n) - 1500.0).abs() < 1.0);
-        let n = p.sh[0].amount.string_to_normalized_value("50%").unwrap();
-        assert!((p.sh[0].amount.preview_plain(n) - 0.5).abs() < 1e-4);
-        let n = p.v_ratio.string_to_normalized_value("4:1").unwrap();
-        assert!((p.v_ratio.preview_plain(n) - 4.0).abs() < 0.01);
+    fn knob_defs_roundtrip() {
+        for k in Kind::ALL {
+            assert!(k.knobs().len() <= N_KNOBS);
+            assert!(k.n_lanes() <= N_LANES);
+            for d in k.knobs() {
+                for n in [0.0, 0.3, 0.77, 1.0] {
+                    assert!((d.norm(d.plain(n)) - n).abs() < 1e-3, "{} {}", d.name, n);
+                }
+                assert!((d.plain(d.default_norm()) - d.def).abs() < 1e-2 * (d.max - d.min).abs().max(1.0), "{}", d.name);
+            }
+        }
     }
 }
