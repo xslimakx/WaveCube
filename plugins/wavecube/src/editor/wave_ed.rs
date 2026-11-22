@@ -8,7 +8,7 @@ use super::widgets::*;
 use super::{commit, edit_wave, set_b, Cx, Drag, Gui, Tool, BASE_W, BAND_NAMES};
 use crate::kinds::LENGTHS;
 use crate::wave::{bend, Pen, Wave};
-use crate::{Custom, GRIDS, N_BANDS, N_CUSTOM, SCOPE_N};
+use crate::{Custom, GRIDS, N_BANDS, N_CUSTOM};
 
 const Y_TOOLS: f32 = 160.0;
 const Y_ED: f32 = 190.0;
@@ -199,19 +199,16 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
     // scope: input dark, output light
     let mode = cx.st.scope_mode;
     if mode < 2 {
-        let bw = inner.width() / SCOPE_N as f32;
-        let sc = |a: f32| (a.min(1.0).sqrt() * inner.height()).max(0.0);
-        for i in 0..SCOPE_N {
-            let x0 = inner.left() + i as f32 * bw;
-            let hi = if mode == 0 { sc(gui.scope_in[i]) } else { 0.0 };
-            let ho = sc(gui.scope_out[i]);
-            if hi > 0.5 {
-                painter.rect_filled(Rect::from_min_max(Pos2::new(x0, inner.bottom() - hi), Pos2::new(x0 + bw - 1.0, inner.bottom())), CornerRadius::ZERO, Color32::from_rgb(0x1b, 0x1f, 0x26));
-            }
-            if ho > 0.5 {
-                painter.rect_filled(Rect::from_min_max(Pos2::new(x0, inner.bottom() - ho), Pos2::new(x0 + bw - 1.0, inner.bottom())), CornerRadius::ZERO, Color32::from_rgb(0x2c, 0x32, 0x3c));
-            }
+        // smooth, filled outlines (input dark behind, output lighter in front)
+        let hgt = inner.height();
+        let h = |v: f32| v.min(1.0).sqrt() * hgt;
+        if mode == 0 {
+            let pin = smooth_outline(&gui.scope_in, inner.left(), inner.width(), inner.bottom(), h);
+            painter.add(fill_to(&pin, inner.bottom(), Color32::from_rgb(0x19, 0x1d, 0x24)));
         }
+        let pout = smooth_outline(&gui.scope_out, inner.left(), inner.width(), inner.bottom(), h);
+        painter.add(fill_to(&pout, inner.bottom(), Color32::from_rgb(0x26, 0x2c, 0x35)));
+        painter.add(Shape::line(pout, PathStroke::new(1.0f32, Color32::from_rgb(0x3a, 0x42, 0x4e))));
     }
     // grid
     let g = cx.st.grid as usize;

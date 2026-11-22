@@ -848,18 +848,19 @@ pub fn tool_view(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
                 painter.vline(inner.left() + inner.width() * k as f32 / divs as f32, inner.y_range(), Stroke::new(1.0f32, Color32::from_rgb(0x1c, 0x20, 0x27)));
             }
             let hh = inner.height() * 0.5;
-            for i in 0..SCOPE_N {
-                let x0 = inner.left() + i as f32 * bw;
-                let l = gui.scope_in[i].min(1.0).sqrt() * hh;
-                let r = gui.scope_out[i].min(1.0).sqrt() * hh;
-                if set.scope_split {
-                    painter.rect_filled(Rect::from_min_max(Pos2::new(x0, mid - l), Pos2::new(x0 + bw - 0.5, mid)), CornerRadius::ZERO, col.gamma_multiply(0.8));
-                    painter.rect_filled(Rect::from_min_max(Pos2::new(x0, mid), Pos2::new(x0 + bw - 0.5, mid + r)), CornerRadius::ZERO, col.gamma_multiply(0.5));
-                } else {
-                    let m = l.max(r);
-                    painter.rect_filled(Rect::from_min_max(Pos2::new(x0, mid - m), Pos2::new(x0 + bw - 0.5, mid + m)), CornerRadius::ZERO, col.gamma_multiply(0.7));
-                }
-            }
+            let _ = bw;
+            let up = |v: f32| v.min(1.0).sqrt() * hh;
+            let down = |v: f32| -(v.min(1.0).sqrt() * hh);
+            let (top, bot) = if set.scope_split {
+                (smooth_outline(&gui.scope_in, inner.left(), inner.width(), mid, up), smooth_outline(&gui.scope_out, inner.left(), inner.width(), mid, down))
+            } else {
+                let m: Vec<f32> = gui.scope_in.iter().zip(gui.scope_out.iter()).map(|(a, b)| a.max(*b)).collect();
+                (smooth_outline(&m, inner.left(), inner.width(), mid, up), smooth_outline(&m, inner.left(), inner.width(), mid, down))
+            };
+            painter.add(fill_to(&top, mid, col.gamma_multiply(0.45)));
+            painter.add(fill_to(&bot, mid, col.gamma_multiply(if set.scope_split { 0.3 } else { 0.45 })));
+            painter.add(Shape::line(top, PathStroke::new(1.3f32, col)));
+            painter.add(Shape::line(bot, PathStroke::new(1.3f32, col.gamma_multiply(0.8))));
             painter.text(er.min + Vec2::new(14.0, 11.0), Align2::LEFT_CENTER, format!("SCOPE · {} · at position {} of the chain", LENGTHS[set.scope_len as usize], cx.st.chain.iter().position(|&c| c as usize == cx.sel).map(|p| p + 1).unwrap_or(0)), pf(9.5), DIM);
             if set.scope_split {
                 painter.text(Pos2::new(inner.left() + 4.0, inner.top() + 6.0), Align2::LEFT_CENTER, "L", pf(9.0), FAINT);

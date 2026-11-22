@@ -457,3 +457,51 @@ pub fn thumb(ui: &Ui, w: &Wave, r: Rect, col: Color32, alpha: u8) {
     ui.painter().add(fill_under(&path, r.bottom(), col, alpha, r.height()));
     ui.painter().add(Shape::line(path, PathStroke::new(1.2f32, col)));
 }
+
+/// A smooth outline through per-bin levels (lightly blurred, Catmull-Rom between bins):
+/// points from left to right, `h(v)` = height in pixels above `base` (negative: below).
+pub fn smooth_outline(vals: &[f32], left: f32, width: f32, base: f32, h: impl Fn(f32) -> f32) -> Vec<Pos2> {
+    let n = vals.len();
+    if n < 2 {
+        return vec![];
+    }
+    // blur [1 2 1] (wraps: the scope is one cycle)
+    let b: Vec<f32> = (0..n).map(|i| (vals[(i + n - 1) % n] + 2.0 * vals[i] + vals[(i + 1) % n]) * 0.25).collect();
+    let y: Vec<f32> = b.iter().map(|&v| h(v)).collect();
+    let at = |i: isize| y[i.rem_euclid(n as isize) as usize];
+    let up = h(1.0) >= 0.0;
+    let clip = |v: f32| if up { v.max(0.0) } else { v.min(0.0) };
+    let sub = 3;
+    let mut out = Vec::with_capacity(n * sub + 1);
+    for i in 0..n as isize {
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        for k in 0..sub {
+            let t = k as f32 / sub as f32;
+            let v = 0.5 * (2.0 * p1 + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t * t * t);
+            let x = left + width * (i as f32 + 0.5 + t) / n as f32;
+            out.push(Pos2::new(x.min(left + width), base - clip(v)));
+        }
+    }
+    out.insert(0, Pos2::new(left, base - clip(at(0))));
+    out.push(Pos2::new(left + width, base - clip(at(n as isize - 1))));
+    out
+}
+
+/// Solid fill between an outline and a base line.
+pub fn fill_to(path: &[Pos2], base: f32, col: Color32) -> Mesh {
+    let mut m = Mesh::default();
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if (b.x - a.x).abs() < 0.01 {
+            continue;
+        }
+        let i = m.vertices.len() as u32;
+        m.colored_vertex(a, col);
+        m.colored_vertex(b, col);
+        m.colored_vertex(Pos2::new(b.x, base), col);
+        m.colored_vertex(Pos2::new(a.x, base), col);
+        m.add_triangle(i, i + 1, i + 2);
+        m.add_triangle(i, i + 2, i + 3);
+    }
+    m
+}
