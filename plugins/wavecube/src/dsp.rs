@@ -1,12 +1,17 @@
-//! The audio side: one LFO per shaper reading its baked shape, envelope followers, an optional
-//! three-band split (Linkwitz-Riley 24 dB/oct, flat sum) and the eight effects.
+//! The audio side: one LFO per shaper reading its baked shape (with swing and a left / right
+//! phase offset), envelope followers (own signal or sidechain), an optional three-band split
+//! (Linkwitz-Riley 24 dB/oct, flat sum) and the eight effects.
+//!
+//! Click safety: shapers fade in / out (8 ms) when switched, added or removed; Amount, Mix and
+//! the global gains are smoothed; delay lines never read audio older than what was written
+//! since the shaper was switched on.
 
 use crate::wave::TABLE;
 use crate::{
     DriveStyle, EnvMode, FilterType, Kind, Mode, NoiseEnv, NoiseType, PanMode, Shared, State, TimeRange, Trigger, WaveCubeParams, N_BANDS,
     N_SHAPERS, N_SLOTS, SCOPE_N,
 };
-use std::f32::consts::{PI, SQRT_2};
+use std::f32::consts::{LN_10, PI, SQRT_2};
 use std::sync::atomic::Ordering;
 
 /// longest Time delay (seconds)
@@ -42,6 +47,10 @@ pub struct ShaperSet {
     pub env_rel: f32,
     pub env_thr: f32,
     pub env_mult: bool,
+    pub env_sc: bool,
+    pub swing: f32,
+    /// right channel phase offset (0..0.5 of a cycle)
+    pub spread: f32,
 }
 
 impl Default for ShaperSet {
@@ -66,6 +75,9 @@ impl Default for ShaperSet {
             env_rel: 150.0,
             env_thr: -40.0,
             env_mult: false,
+            env_sc: false,
+            swing: 0.0,
+            spread: 0.0,
         }
     }
 }
@@ -79,6 +91,7 @@ pub struct Settings {
     pub mix: f32,
     pub trig: f32,
     pub midi_switch: bool,
+    pub safe_clip: bool,
     pub sh: [ShaperSet; N_SHAPERS],
     // volume
     pub v_trim: f32,
@@ -90,6 +103,7 @@ pub struct Settings {
     pub v_rel: f32,
     pub v_makeup: f32,
     pub v_auto: bool,
+    pub v_sc: bool,
     // filter
     pub f_type: FilterType,
     pub f_lo: f32,
@@ -132,7 +146,23 @@ pub struct Settings {
 
 #[inline]
 fn db2lin(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    (db * (LN_10 / 20.0)).exp()
+}
+
+/// one-pole smoothing coefficient for a time constant in ms
+#[inline]
+fn coef_ms(ms: f32, sr: f32) -> f32 {
+    if ms < 0.005 {
+        1.0
+    } else {
+        1.0 - (-1.0 / (ms * 0.001 * sr)).exp()
+    }
+}
+
+/// one-pole low-pass coefficient for a cutoff in Hz
+#[inline]
+fn coef_hz(hz: f32, sr: f32) -> f32 {
+    1.0 - (-2.0 * PI * hz.min(sr * 0.45) / sr).exp()
 }
 
 impl Settings {
@@ -161,6 +191,9 @@ impl Settings {
                 env_rel: q.env_rel.value(),
                 env_thr: q.env_thr.value(),
                 env_mult: q.env_mode.value() == EnvMode::Multiply,
+                env_sc: q.env_sc.value(),
+                swing: q.swing.value(),
+                spread: q.spread.value() / 360.0,
             };
         }
         Self {
@@ -170,6 +203,7 @@ impl Settings {
             mix: p.mix.value(),
             trig: db2lin(p.trig_db.value()),
             midi_switch: p.midi_switch.value(),
+            safe_clip: p.safe_clip.value(),
             sh,
             v_trim: db2lin(p.v_trim.value()),
             v_comp: p.v_comp.value(),
@@ -180,6 +214,7 @@ impl Settings {
             v_rel: p.v_rel.value(),
             v_makeup: p.v_makeup.value(),
             v_auto: p.v_auto.value(),
+            v_sc: p.v_sc.value(),
             f_type: p.f_type.value(),
             f_lo: p.f_lo.value(),
             f_hi: p.f_hi.value(),
@@ -344,6 +379,69 @@ fn drive_curve(style: DriveStyle, v: f32) -> f32 {
     }
 }
 
+/// Soft safety clipper: transparent below 0.9, never above 1.0.
+#[inline]
+fn safe(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= 0.9 {
+        x
+    } else {
+        (0.9 + 0.1 * ((a - 0.9) * 10.0).tanh()).copysign(x)
+    }
+}
+
+/// Swing: the second step of every pair of grid steps starts later.
+#[inline]
+fn swing_warp(ph: f32, swing: f32, grid: f32) -> f32 {
+    if swing < 1e-4 {
+        return ph;
+    }
+    let pair = 2.0 / grid;
+    let base = (ph / pair).floor() * pair;
+    let t = (ph - base) / pair;
+    let mid = 0.5 + 0.25 * swing;
+    let t2 = if t < mid { 0.5 * t / mid } else { 0.5 + 0.5 * (t - mid) / (1.0 - mid) };
+    (base + t2 * pair).min(0.999_999)
+}
+
+/// Per-block coefficients for the effects (no exp / tan per sample).
+#[derive(Clone, Copy)]
+struct Coefs {
+    comp_a: f32,
+    comp_r: f32,
+    comp_hold: u32,
+    crush_aa: f32,
+    crush_lp: f32,
+    crush_steps: f32,
+    crush_rate: f32,
+    tone_a: f32,
+    dc_r: f32,
+    air_a: f32,
+    tape_a: f32,
+    tape_a2: f32,
+    fstereo: [f32; 2],
+}
+
+impl Coefs {
+    fn new(p: &Settings, sr: f32) -> Self {
+        Self {
+            comp_a: coef_ms(p.v_att.max(0.01), sr),
+            comp_r: coef_ms(p.v_rel, sr),
+            comp_hold: (p.v_hold * 0.001 * sr) as u32,
+            crush_aa: coef_hz(p.c_rate * 0.45, sr),
+            crush_lp: coef_hz(p.c_lp, sr),
+            crush_steps: 2f32.powf(p.c_bits - 1.0),
+            crush_rate: (p.c_rate / sr).min(1.0),
+            tone_a: coef_hz(1200.0, sr),
+            dc_r: 1.0 - 2.0 * PI * 12.0 / sr,
+            air_a: coef_hz(5000.0, sr),
+            tape_a: coef_hz(9000.0, sr),
+            tape_a2: coef_hz(400.0, sr),
+            fstereo: [2f32.powf(p.f_stereo / 24.0), 2f32.powf(-p.f_stereo / 24.0)],
+        }
+    }
+}
+
 /// One noise source (three of them make the stereo noise).
 #[derive(Default, Clone, Copy)]
 struct NoiseGen {
@@ -373,7 +471,7 @@ impl NoiseGen {
     }
 
     #[inline]
-    fn next(&mut self, t: NoiseType, rng: &mut Rng, sr: f32, hum: f32) -> f32 {
+    fn next(&mut self, t: NoiseType, rng: &mut Rng, sr: f32, hum: f32, c: &Coefs) -> f32 {
         let w = rng.next();
         match t {
             NoiseType::White => w * 0.5,
@@ -401,16 +499,13 @@ impl NoiseGen {
             }
             NoiseType::Hum => hum + w * 0.004,
             NoiseType::Air => {
-                let a = 1.0 - (-2.0 * PI * 5000.0 / sr).exp();
-                self.lp += (w - self.lp) * a;
+                self.lp += (w - self.lp) * c.air_a;
                 (w - self.lp) * 0.7
             }
             NoiseType::Tape => {
                 let p = self.pink(w);
-                let a = 1.0 - (-2.0 * PI * 9000.0 / sr).exp();
-                self.lp2 += (p - self.lp2) * a;
-                let a2 = 1.0 - (-2.0 * PI * 400.0 / sr).exp();
-                self.lp += (self.lp2 - self.lp) * a2;
+                self.lp2 += (p - self.lp2) * c.tape_a;
+                self.lp += (self.lp2 - self.lp) * c.tape_a2;
                 (self.lp2 - self.lp) * 1.6
             }
         }
@@ -425,16 +520,17 @@ impl NoiseGen {
 struct BandState {
     /// filter stages per channel (up to 8 for the phasers)
     svf: [[Svf; 8]; 2],
-    /// cached filter coefficients per channel: (freq, k, coef)
-    fc: [Option<(f32, f32, SvfCoef)>; 2],
+    /// cached filter coefficients per channel: (freq, k, main, second stage)
+    fc: [Option<(f32, f32, SvfCoef, SvfCoef)>; 2],
     hold: [f32; 2],
     count: f32,
     lp: [f32; 2],
-    lp2: [f32; 2],
     aa: [[f32; 2]; 2],
     dc: [(f32, f32); 2],
     grip: f32,
     delay: Vec<[f32; 2]>,
+    /// samples written into `delay` since the shaper was switched on
+    valid: usize,
     haas: Vec<[f32; 2]>,
     haas_w: usize,
     env: f32,
@@ -451,9 +547,9 @@ struct ShaperDsp {
     cycle: f32,
     /// Time range in samples
     time_len: f32,
-    /// LFO value per band (smoothed) and the value with the envelope applied
-    y: [f32; N_BANDS],
-    y_eff: [f32; N_BANDS],
+    /// LFO value per band and channel (smoothed), and with the envelope applied
+    y: [[f32; 2]; N_BANDS],
+    y_eff: [[f32; 2]; N_BANDS],
     smooth_a: f32,
     split: [Split3; 2],
     noise_split: [Split3; 2],
@@ -470,6 +566,11 @@ struct ShaperDsp {
     env_r: f32,
     env_h: u32,
     solo: u32,
+    /// on / off fade (0..1) and whether the shaper is running
+    fade: f32,
+    active: bool,
+    amt_s: f32,
+    mix_s: f32,
 }
 
 impl ShaperDsp {
@@ -489,8 +590,8 @@ impl ShaperDsp {
             inc: 0.0,
             cycle: sr,
             time_len: sr,
-            y: [1.0; N_BANDS],
-            y_eff: [1.0; N_BANDS],
+            y: [[1.0; 2]; N_BANDS],
+            y_eff: [[1.0; 2]; N_BANDS],
             smooth_a: 1.0,
             split: Default::default(),
             noise_split: Default::default(),
@@ -506,31 +607,41 @@ impl ShaperDsp {
             env_r: 1.0,
             env_h: 0,
             solo: 0,
+            fade: 0.0,
+            active: false,
+            amt_s: 1.0,
+            mix_s: 1.0,
         }
     }
 
-    fn reset(&mut self) {
+    /// Fresh state when the shaper starts running (nothing old comes back).
+    fn activate(&mut self) {
         self.primed = false;
-        self.done = false;
         self.split = Default::default();
         self.noise_split = Default::default();
         for b in self.band.iter_mut() {
             b.svf = Default::default();
+            b.fc = [None; 2];
             b.hold = [0.0; 2];
             b.count = 0.0;
             b.lp = [0.0; 2];
-            b.lp2 = [0.0; 2];
             b.aa = [[0.0; 2]; 2];
             b.dc = [(0.0, 0.0); 2];
+            b.grip = 0.0;
             b.env = 0.0;
             b.comp = 0.0;
-            for d in b.delay.iter_mut() {
-                *d = [0.0; 2];
-            }
+            b.valid = 0;
             for d in b.haas.iter_mut() {
                 *d = [0.0; 2];
             }
         }
+    }
+
+    fn reset(&mut self) {
+        self.activate();
+        self.done = false;
+        self.active = false;
+        self.fade = 0.0;
     }
 }
 
@@ -547,9 +658,20 @@ pub struct Engine {
     slot_dest: [Option<(usize, usize)>; N_SLOTS],
     switch_count: u32,
     order: [usize; N_SHAPERS],
+    present: [bool; N_SHAPERS],
+    grid: f32,
     sh: Vec<ShaperDsp>,
     rng: Rng,
-    // audio trigger
+    co: Coefs,
+    // fixed coefficients
+    k_fast_rel: f32,
+    k_slow_att: f32,
+    k_slow_rel: f32,
+    k_fol_att: f32,
+    k_fol_rel: f32,
+    k_fade: f32,
+    k_param: f32,
+    // audio trigger / follow
     env_fast: f32,
     env_slow: f32,
     hold: u32,
@@ -560,8 +682,10 @@ pub struct Engine {
     hum_ph: f32,
     noise_f: [[Svf; 2]; 2],
     noise_c: (SvfCoef, SvfCoef),
-    // bypass / master mix fade
+    // smoothed globals
     wet: f32,
+    in_s: f32,
+    out_s: f32,
     gr: f32,
     // scope
     bin: usize,
@@ -581,6 +705,7 @@ fn boxed<T: Clone, const N: usize>(v: T) -> Box<[T; N]> {
 
 impl Engine {
     pub fn new(sr: f32) -> Self {
+        let d = Settings::from_params(&WaveCubeParams::default());
         Self {
             sr,
             tempo: 120.0,
@@ -590,8 +715,18 @@ impl Engine {
             slot_dest: [None; N_SLOTS],
             switch_count: 0,
             order: std::array::from_fn(|i| i),
+            present: [true; N_SHAPERS],
+            grid: 16.0,
             sh: Kind::ALL.iter().map(|&k| ShaperDsp::new(k, sr)).collect(),
             rng: Rng(0x9e3779b9),
+            co: Coefs::new(&d, sr),
+            k_fast_rel: coef_ms(12.0, sr),
+            k_slow_att: coef_ms(30.0, sr),
+            k_slow_rel: coef_ms(250.0, sr),
+            k_fol_att: coef_ms(2.0, sr),
+            k_fol_rel: coef_ms(80.0, sr),
+            k_fade: 1.0 / (0.008 * sr),
+            k_param: coef_ms(15.0, sr),
             env_fast: 0.0,
             env_slow: 0.0,
             hold: 0,
@@ -602,6 +737,8 @@ impl Engine {
             noise_f: Default::default(),
             noise_c: (SvfCoef::new(120.0, sr, SQRT_2), SvfCoef::new(16000.0, sr, SQRT_2)),
             wet: 1.0,
+            in_s: 1.0,
+            out_s: 1.0,
             gr: 0.0,
             bin: 0,
             acc_in: 0.0,
@@ -618,6 +755,7 @@ impl Engine {
         self.env_fast = 0.0;
         self.env_slow = 0.0;
         self.hold = 0;
+        self.noise_f = Default::default();
     }
 
     pub fn bake(&mut self, st: &State) {
@@ -627,7 +765,9 @@ impl Engine {
                     w.bake(&mut self.tables[s][b]);
                 }
             }
+            self.present[s] = st.present.get(s).copied().unwrap_or(true);
         }
+        self.grid = st.grid.max(1) as f32;
         for i in 0..N_SLOTS {
             self.slot_dest[i] = None;
             if let Some(Some(slot)) = st.slots.get(i) {
@@ -678,7 +818,7 @@ impl Engine {
         self.tempo = tempo as f32;
         shared.tempo.store(self.tempo, Ordering::Relaxed);
         let sr = self.sr;
-        let ms_a = |ms: f32| if ms < 0.005 { 1.0 } else { 1.0 - (-1.0 / (ms * 0.001 * sr)).exp() };
+        self.co = Coefs::new(p, sr);
         for si in 0..N_SHAPERS {
             let q = p.sh[si];
             self.set_inc(si, &q);
@@ -691,12 +831,12 @@ impl Engine {
             if q.trigger == Trigger::Off {
                 s.done = false;
             }
-            s.smooth_a = ms_a(q.smooth_ms);
-            s.env_a = ms_a(q.env_att);
-            s.env_r = ms_a(q.env_rel);
+            s.smooth_a = coef_ms(q.smooth_ms, sr);
+            s.env_a = coef_ms(q.env_att, sr);
+            s.env_r = coef_ms(q.env_rel, sr);
             s.env_h = (q.env_hold * 0.001 * sr) as u32;
             let bar = 4.0 * 60.0 / self.tempo * sr;
-            let len = match p.t_range {
+            s.time_len = match p.t_range {
                 TimeRange::Cycle => s.cycle,
                 TimeRange::Bar1 => bar,
                 TimeRange::Bar2 => 2.0 * bar,
@@ -706,14 +846,18 @@ impl Engine {
                 TimeRange::Ms10 => 0.010 * sr,
                 TimeRange::Ms20 => 0.020 * sr,
             };
-            s.time_len = len;
             s.solo = if q.multiband { shared.solo[si].load(Ordering::Relaxed) & 7 } else { 0 };
             if q.multiband {
                 s.c1 = SvfCoef::new(q.x_lo, sr, SQRT_2);
                 s.c2 = SvfCoef::new(q.x_hi, sr, SQRT_2);
-                if !s.was_multi {
-                    s.split = Default::default();
-                    s.noise_split = Default::default();
+            }
+            if q.multiband != s.was_multi {
+                // the bands change: no old audio, no filter memory from the other layout
+                s.split = Default::default();
+                s.noise_split = Default::default();
+                for b in s.band.iter_mut() {
+                    b.valid = 0;
+                    b.svf = Default::default();
                 }
             }
             s.was_multi = q.multiband;
@@ -737,16 +881,18 @@ impl Engine {
         }
     }
 
-    /// One stereo frame. `note`: a MIDI note started at this sample.
-    pub fn process(&mut self, x: [f32; 2], stereo: bool, note: Option<u8>, p: &Settings, shared: &Shared) -> [f32; 2] {
+    /// One stereo frame. `sc`: sidechain input; `note`: a MIDI note started at this sample.
+    pub fn process(&mut self, x: [f32; 2], sc: [f32; 2], stereo: bool, note: Option<u8>, p: &Settings, shared: &Shared) -> [f32; 2] {
         let sr = self.sr;
-        let input = [x[0] * p.in_gain, x[1] * p.in_gain];
+        self.in_s += (p.in_gain - self.in_s) * self.k_param;
+        self.out_s += (p.out_gain - self.out_s) * self.k_param;
+        let input = [x[0] * self.in_s, x[1] * self.in_s];
 
         // ---- audio trigger: a fast envelope jumping over a slow one
         let lv = input[0].abs().max(input[1].abs());
-        let af = if lv > self.env_fast { 0.3 } else { 1.0 - (-1.0 / (0.012 * sr)).exp() };
+        let af = if lv > self.env_fast { 0.3 } else { self.k_fast_rel };
         self.env_fast += (lv - self.env_fast) * af;
-        let as_ = if lv > self.env_slow { 1.0 - (-1.0 / (0.03 * sr)).exp() } else { 1.0 - (-1.0 / (0.25 * sr)).exp() };
+        let as_ = if lv > self.env_slow { self.k_slow_att } else { self.k_slow_rel };
         self.env_slow += (lv - self.env_slow) * as_;
         let mut audio_trig = false;
         if self.hold > 0 {
@@ -755,7 +901,7 @@ impl Engine {
             audio_trig = true;
             self.hold = (0.06 * sr) as u32;
         }
-        let fa = if lv > self.follow { 1.0 - (-1.0 / (0.002 * sr)).exp() } else { 1.0 - (-1.0 / (0.08 * sr)).exp() };
+        let fa = if lv > self.follow { self.k_fol_att } else { self.k_fol_rel };
         self.follow += (lv - self.follow) * fa;
 
         // ---- MIDI: switch user waves (C# .. A) or trigger (any note; only C with MIDI Switch)
@@ -788,13 +934,15 @@ impl Engine {
         }
 
         // ---- noise source (once per frame, split like the signal)
-        let noise = if p.sh[Kind::Noise.index()].on {
+        let ni = Kind::Noise.index();
+        let noise = if self.sh[ni].active || (p.sh[ni].on && self.present[ni]) {
             self.hum_ph = (self.hum_ph + 50.0 / sr) % 1.0;
             let h = 2.0 * PI * self.hum_ph;
             let hum = (h.sin() + 0.5 * (2.0 * h).sin() + 0.3 * (3.0 * h).sin() + 0.15 * (5.0 * h).sin()) * 0.3;
-            let c = self.gens[0].next(p.n_type, &mut self.rng, sr, hum);
-            let l = self.gens[1].next(p.n_type, &mut self.rng, sr, hum);
-            let r = self.gens[2].next(p.n_type, &mut self.rng, sr, hum);
+            let co = self.co;
+            let c = self.gens[0].next(p.n_type, &mut self.rng, sr, hum, &co);
+            let l = self.gens[1].next(p.n_type, &mut self.rng, sr, hum, &co);
+            let r = self.gens[2].next(p.n_type, &mut self.rng, sr, hum, &co);
             let st = if p.n_type == NoiseType::Hum { 0.0 } else { p.n_stereo };
             let mut n = [c + (l - c) * st, c + (r - c) * st];
             for (ch, v) in n.iter_mut().enumerate() {
@@ -812,24 +960,62 @@ impl Engine {
         for k in 0..N_SHAPERS {
             let si = self.order[k];
             let q = p.sh[si];
-            if !q.on {
-                continue;
+            let target = if q.on && self.present[si] { 1.0 } else { 0.0 };
+            {
+                let s = &mut self.sh[si];
+                if target > 0.5 && !s.active {
+                    s.activate();
+                    s.active = true;
+                    s.fade = 0.0;
+                }
+                if !s.active {
+                    continue;
+                }
+                // linear 8 ms ramp: exactly 1 (fully on) or 0 (off) when it ends
+                if target > s.fade {
+                    s.fade = (s.fade + self.k_fade).min(1.0);
+                } else if target < s.fade {
+                    s.fade = (s.fade - self.k_fade).max(0.0);
+                }
+                if target < 0.5 && s.fade <= 0.0 {
+                    s.fade = 0.0;
+                    s.active = false;
+                    continue;
+                }
             }
-            let ph = if self.sh[si].done { 0.99999 } else { (self.sh[si].phase as f32 + q.offset).rem_euclid(1.0) };
+            let grid = self.grid;
+            let base = if self.sh[si].done { 0.99999 } else { (self.sh[si].phase as f32 + q.offset).rem_euclid(1.0) };
+            let ph = [swing_warp(base, q.swing, grid), swing_warp((base + q.spread).rem_euclid(1.0), q.swing, grid)];
             let nb = if q.multiband { N_BANDS } else { 1 };
             let primed = self.sh[si].primed && self.sh[si].primed_bands >= nb;
             for b in 0..nb {
-                let raw = self.lookup(si, b, ph);
+                let raw_l = self.lookup(si, b, ph[0]);
+                let raw_r = if q.spread > 1e-5 { self.lookup(si, b, ph[1]) } else { raw_l };
                 let s = &mut self.sh[si];
                 if primed {
-                    s.y[b] += (raw - s.y[b]) * s.smooth_a;
+                    s.y[b][0] += (raw_l - s.y[b][0]) * s.smooth_a;
+                    s.y[b][1] += (raw_r - s.y[b][1]) * s.smooth_a;
                 } else {
-                    s.y[b] = raw;
+                    s.y[b] = [raw_l, raw_r];
                 }
             }
-            self.sh[si].primed = true;
-            self.sh[si].primed_bands = nb;
-            sig = self.run_shaper(si, sig, stereo, &q, p, noise);
+            {
+                let s = &mut self.sh[si];
+                if !s.primed {
+                    s.amt_s = q.amount;
+                    s.mix_s = q.mix;
+                }
+                s.amt_s += (q.amount - s.amt_s) * self.k_param;
+                s.mix_s += (q.mix - s.mix_s) * self.k_param;
+                s.primed = true;
+                s.primed_bands = nb;
+            }
+            let mut qs = q;
+            qs.amount = self.sh[si].amt_s;
+            qs.mix = self.sh[si].mix_s;
+            let out = self.run_shaper(si, sig, sc, stereo, &qs, p, noise);
+            let f = self.sh[si].fade;
+            sig = [sig[0] + (out[0] - sig[0]) * f, sig[1] + (out[1] - sig[1]) * f];
         }
 
         // ---- advance every LFO (also those that are off, so they stay in time)
@@ -848,30 +1034,39 @@ impl Engine {
             }
         }
 
-        // ---- master mix / bypass (short fade, no clicks)
+        // ---- master mix / bypass (short fade, no clicks), safety clipper
         let target = if p.bypass { 0.0 } else { p.mix };
-        self.wet += (target - self.wet) * (1.0 - (-1.0 / (0.01 * sr)).exp());
-        let out = [x[0] + (sig[0] * p.out_gain - x[0]) * self.wet, x[1] + (sig[1] * p.out_gain - x[1]) * self.wet];
-        let out = [if out[0].is_finite() { out[0] } else { 0.0 }, if out[1].is_finite() { out[1] } else { 0.0 }];
-
-        // ---- scope of the shaper shown in the editor
-        let view = (shared.view.load(Ordering::Relaxed) as usize).min(N_SHAPERS - 1);
-        let vph = (self.sh[view].phase as f32 + p.sh[view].offset).rem_euclid(1.0);
-        let bin = ((vph * SCOPE_N as f32) as usize).min(SCOPE_N - 1);
-        if bin != self.bin {
-            shared.scope_in[self.bin].store(self.acc_in, Ordering::Relaxed);
-            shared.scope_out[self.bin].store(self.acc_out, Ordering::Relaxed);
-            let mut b = (self.bin + 1) % SCOPE_N;
-            let mut guard = 0;
-            while b != bin && guard < SCOPE_N {
-                shared.scope_in[b].store(self.acc_in, Ordering::Relaxed);
-                shared.scope_out[b].store(self.acc_out, Ordering::Relaxed);
-                b = (b + 1) % SCOPE_N;
-                guard += 1;
+        self.wet += (target - self.wet) * self.k_param;
+        let mut out = [x[0] + (sig[0] * self.out_s - x[0]) * self.wet, x[1] + (sig[1] * self.out_s - x[1]) * self.wet];
+        for o in out.iter_mut() {
+            if !o.is_finite() {
+                *o = 0.0;
+            } else if p.safe_clip && !p.bypass {
+                *o = safe(*o);
             }
-            self.bin = bin;
-            self.acc_in = 0.0;
-            self.acc_out = 0.0;
+        }
+
+        // ---- scope of the shaper shown in the editor (skipped for audio-rate LFOs)
+        let view = (shared.view.load(Ordering::Relaxed) as usize).min(N_SHAPERS - 1);
+        if self.sh[view].inc < 1.0 / 32.0 {
+            let vph = (self.sh[view].phase as f32 + p.sh[view].offset).rem_euclid(1.0);
+            let bin = ((vph * SCOPE_N as f32) as usize).min(SCOPE_N - 1);
+            if bin != self.bin {
+                let mut b = self.bin;
+                let mut guard = 0;
+                loop {
+                    shared.scope_in[b].store(self.acc_in, Ordering::Relaxed);
+                    shared.scope_out[b].store(self.acc_out, Ordering::Relaxed);
+                    b = (b + 1) % SCOPE_N;
+                    guard += 1;
+                    if b == bin || guard >= 8 {
+                        break;
+                    }
+                }
+                self.bin = bin;
+                self.acc_in = 0.0;
+                self.acc_out = 0.0;
+            }
         }
         let li = x[0].abs().max(x[1].abs());
         let lo = out[0].abs().max(out[1].abs());
@@ -886,7 +1081,7 @@ impl Engine {
         for (i, s) in self.sh.iter().enumerate() {
             shared.phase[i].store(if s.done { 0.99999 } else { s.phase as f32 }, Ordering::Relaxed);
             for b in 0..N_BANDS {
-                shared.value[i][b].store(s.y_eff[b], Ordering::Relaxed);
+                shared.value[i][b].store(s.y_eff[b][0], Ordering::Relaxed);
             }
             shared.env[i].store(s.band[0].env, Ordering::Relaxed);
         }
@@ -897,10 +1092,11 @@ impl Engine {
         self.pk_out = 0.0;
     }
 
-    fn run_shaper(&mut self, si: usize, x: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings, noise: [f32; 2]) -> [f32; 2] {
+    #[allow(clippy::too_many_arguments)]
+    fn run_shaper(&mut self, si: usize, x: [f32; 2], sc: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings, noise: [f32; 2]) -> [f32; 2] {
         let kind = self.sh[si].kind;
         if !q.multiband {
-            let wet = self.band_fx(si, 0, x, noise, stereo, q, p);
+            let wet = self.band_fx(si, 0, x, sc, noise, stereo, q, p);
             return [x[0] + (wet[0] - x[0]) * q.mix, x[1] + (wet[1] - x[1]) * q.mix];
         }
         let s = &mut self.sh[si];
@@ -916,7 +1112,7 @@ impl Engine {
         let mut out = [0.0f32; 2];
         for b in 0..N_BANDS {
             let xb = [bl[b], br[b]];
-            let wet = self.band_fx(si, b, xb, [nl[b], nr[b]], stereo, q, p);
+            let wet = self.band_fx(si, b, xb, sc, [nl[b], nr[b]], stereo, q, p);
             if solo != 0 && solo & (1 << b) == 0 {
                 continue;
             }
@@ -926,15 +1122,16 @@ impl Engine {
         out
     }
 
-    /// Envelope follower on the band, applied to the LFO value; then the effect.
+    /// Envelope follower on the band (or the sidechain), applied to the LFO value; then the effect.
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn band_fx(&mut self, si: usize, b: usize, x: [f32; 2], noise: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings) -> [f32; 2] {
+    fn band_fx(&mut self, si: usize, b: usize, x: [f32; 2], sc: [f32; 2], noise: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings) -> [f32; 2] {
         let s = &mut self.sh[si];
         let mut y = s.y[b];
         if q.env_on && s.kind.has_envelope() {
             let bs = &mut s.band[b];
-            let lvl = x[0].abs().max(x[1].abs());
+            let src = if q.env_sc { sc } else { x };
+            let lvl = src[0].abs().max(src[1].abs());
             if lvl > bs.env {
                 bs.env += (lvl - bs.env) * s.env_a;
                 bs.env_hold = s.env_h;
@@ -946,58 +1143,66 @@ impl Engine {
             let db = 20.0 * bs.env.max(1e-6).log10();
             let thr = q.env_thr.min(-0.5);
             let e = ((db - thr) / -thr).clamp(0.0, 1.0);
-            y = if q.env_mult {
-                if q.env_amt >= 0.0 {
-                    y * (e * q.env_amt).clamp(0.0, 1.0)
+            for v in y.iter_mut() {
+                *v = if q.env_mult {
+                    if q.env_amt >= 0.0 {
+                        *v * (e * q.env_amt).clamp(0.0, 1.0)
+                    } else {
+                        *v * (1.0 - (e * -q.env_amt).clamp(0.0, 1.0))
+                    }
                 } else {
-                    y * (1.0 - (e * -q.env_amt).clamp(0.0, 1.0))
-                }
-            } else {
-                (y + q.env_amt * e).clamp(0.0, 1.0)
-            };
+                    (*v + q.env_amt * e).clamp(0.0, 1.0)
+                };
+            }
         }
         s.y_eff[b] = y;
-        self.effect(si, b, y, x, noise, stereo, q, p)
+        self.effect(si, b, y, x, sc, noise, stereo, q, p)
     }
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn effect(&mut self, si: usize, b: usize, y: f32, x: [f32; 2], noise: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings) -> [f32; 2] {
+    fn effect(&mut self, si: usize, b: usize, y: [f32; 2], x: [f32; 2], sc: [f32; 2], noise: [f32; 2], stereo: bool, q: &ShaperSet, p: &Settings) -> [f32; 2] {
         let amt = q.amount;
         let sr = self.sr;
+        let co = self.co;
         match self.sh[si].kind {
             Kind::Volume => {
-                let mut g = (1.0 - amt * (1.0 - y)) * p.v_trim;
+                let g = [(1.0 - amt * (1.0 - y[0])) * p.v_trim, (1.0 - amt * (1.0 - y[1])) * p.v_trim];
+                let mut cg = 1.0;
                 if p.v_comp {
                     let bs = &mut self.sh[si].band[b];
-                    let det = x[0].abs().max(x[1].abs());
-                    let a = 1.0 - (-1.0 / (p.v_att.max(0.01) * 0.001 * sr)).exp();
-                    let r = 1.0 - (-1.0 / (p.v_rel * 0.001 * sr)).exp();
+                    let src = if p.v_sc { sc } else { x };
+                    let det = src[0].abs().max(src[1].abs());
                     if det > bs.comp {
-                        bs.comp += (det - bs.comp) * a;
-                        bs.comp_hold = (p.v_hold * 0.001 * sr) as u32;
+                        bs.comp += (det - bs.comp) * co.comp_a;
+                        bs.comp_hold = co.comp_hold;
                     } else if bs.comp_hold > 0 {
                         bs.comp_hold -= 1;
                     } else {
-                        bs.comp += (det - bs.comp) * r;
+                        bs.comp += (det - bs.comp) * co.comp_r;
                     }
                     let lvl = 20.0 * bs.comp.max(1e-6).log10();
                     let slope = 1.0 - 1.0 / p.v_ratio.max(1.0);
                     let gr = (lvl - p.v_thr).max(0.0) * slope;
                     let makeup = p.v_makeup + if p.v_auto { -p.v_thr * slope * 0.5 } else { 0.0 };
-                    g *= db2lin(makeup - gr);
+                    cg = db2lin(makeup - gr);
                     self.gr = self.gr.max(gr);
                 }
-                [x[0] * g, x[1] * g]
+                [x[0] * g[0] * cg, x[1] * g[1] * cg]
             }
             Kind::Pan => {
+                let bs = &mut self.sh[si].band[b];
+                // the Haas line always runs, so switching Haas on never plays stale audio
+                let len = bs.haas.len();
+                let w = bs.haas_w;
+                bs.haas[w] = x;
+                bs.haas_w = (w + 1) % len;
                 if !stereo {
                     return x;
                 }
                 // +1 = left
-                let pv = (amt * (2.0 * y - 1.0)).clamp(-1.0, 1.0);
+                let pv = (amt * (2.0 * y[0] - 1.0)).clamp(-1.0, 1.0);
                 let k = pv.abs();
-                // level panning
                 let lvl = match p.p_mode {
                     PanMode::Combined => {
                         if pv >= 0.0 {
@@ -1025,18 +1230,12 @@ impl Engine {
                 if p.p_haas < 1e-4 {
                     return lvl;
                 }
-                // Haas: delay the far side
-                let bs = &mut self.sh[si].band[b];
-                let len = bs.haas.len();
-                let w = bs.haas_w;
-                bs.haas[w] = x;
-                bs.haas_w = (w + 1) % len;
                 let d = (p.p_haas_ms * 0.001 * sr * k).clamp(0.0, (len - 2) as f32);
                 let pos = w as f32 - d;
                 let i = pos.floor();
                 let f = pos - i;
                 let i0 = (i as isize).rem_euclid(len as isize) as usize;
-                let i1 = (i0 + 1) % len;
+                let i1 = if d < 1.0 { w } else { (i0 + 1) % len };
                 let rd = |ch: usize| bs.haas[i0][ch] + (bs.haas[i1][ch] - bs.haas[i0][ch]) * f;
                 let haas = if pv >= 0.0 { [x[0], rd(1)] } else { [rd(0), x[1]] };
                 [lvl[0] + (haas[0] - lvl[0]) * p.p_haas, lvl[1] + (haas[1] - lvl[1]) * p.p_haas]
@@ -1045,7 +1244,7 @@ impl Engine {
                 if !stereo {
                     return x;
                 }
-                let w = (1.0 + amt * (2.0 * y - 1.0)).max(0.0);
+                let w = (1.0 + amt * (2.0 * y[0] - 1.0)).max(0.0);
                 let m = 0.5 * (x[0] + x[1]);
                 let s = 0.5 * (x[0] - x[1]) * w;
                 [(m + s) * p.w_gain, (m - s) * p.w_gain]
@@ -1055,29 +1254,36 @@ impl Engine {
                 let s = &mut self.sh[si];
                 let len = s.band[b].delay.len();
                 let w = s.write;
-                s.band[b].delay[w] = x;
-                let d = ((1.0 - y) * amt * s.time_len).clamp(0.0, (len - 4) as f32);
-                let out = if d < 1e-3 {
-                    x
-                } else {
-                    let buf = &s.band[b].delay;
-                    let pos = w as f32 - d;
-                    let n = buf.len() as isize;
-                    let i = pos.floor();
-                    let t = pos - i;
-                    let i = i as isize;
-                    let at = |k: isize| buf[(i + k).rem_euclid(n) as usize];
-                    let (xm1, x0, x1, x2) = (at(-1), at(0), at(1), at(2));
-                    let mut o = [0.0; 2];
-                    for ch in 0..2 {
-                        let c0 = x0[ch];
-                        let c1 = 0.5 * (x1[ch] - xm1[ch]);
-                        let c2 = xm1[ch] - 2.5 * x0[ch] + 2.0 * x1[ch] - 0.5 * x2[ch];
-                        let c3 = 0.5 * (x2[ch] - xm1[ch]) + 1.5 * (x0[ch] - x1[ch]);
-                        o[ch] = ((c3 * t + c2) * t + c1) * t + c0;
-                    }
-                    o
-                };
+                let bs = &mut s.band[b];
+                bs.delay[w] = x;
+                bs.valid = (bs.valid + 1).min(len);
+                // never older than what was written since the shaper started
+                let max_d = (bs.valid as f32 - 4.0).max(0.0);
+                let mut out = [0.0; 2];
+                for ch in 0..2 {
+                    let d = ((1.0 - y[ch]) * amt * s.time_len).clamp(0.0, max_d.min((len - 4) as f32));
+                    out[ch] = if d < 1e-3 {
+                        x[ch]
+                    } else {
+                        let buf = &bs.delay;
+                        let pos = w as f32 - d;
+                        let n = len as isize;
+                        let i = pos.floor();
+                        let t = pos - i;
+                        let i = i as isize;
+                        let at = |k: isize| buf[(i + k).rem_euclid(n) as usize][ch];
+                        if d < 2.0 {
+                            // too close to the write head for 4-point interpolation
+                            at(0) + (at(1) - at(0)) * t
+                        } else {
+                            let (xm1, x0, x1, x2) = (at(-1), at(0), at(1), at(2));
+                            let c1 = 0.5 * (x1 - xm1);
+                            let c2 = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
+                            let c3 = 0.5 * (x2 - xm1) + 1.5 * (x0 - x1);
+                            ((c3 * t + c2) * t + c1) * t + x0
+                        }
+                    };
+                }
                 let last = if q.multiband { N_BANDS - 1 } else { 0 };
                 if b == last {
                     s.write = (w + 1) % len;
@@ -1085,31 +1291,27 @@ impl Engine {
                 out
             }
             Kind::Noise => {
-                let mut lvl = amt * y;
                 let f = (self.follow * 4.0).min(1.0);
-                match p.n_env {
-                    NoiseEnv::Off => {}
-                    NoiseEnv::Follow => lvl *= 1.0 + (f - 1.0) * p.n_env_amt,
-                    NoiseEnv::Duck => lvl *= 1.0 - p.n_env_amt * f,
-                }
+                let env = match p.n_env {
+                    NoiseEnv::Off => 1.0,
+                    NoiseEnv::Follow => 1.0 + (f - 1.0) * p.n_env_amt,
+                    NoiseEnv::Duck => 1.0 - p.n_env_amt * f,
+                };
                 let base = if p.n_only { [0.0; 2] } else { x };
-                let mut out = [base[0] + noise[0] * lvl, base[1] + noise[1] * lvl];
+                let mut out = [base[0] + noise[0] * amt * y[0] * env, base[1] + noise[1] * amt * y[1] * env];
                 if !stereo {
                     out[1] = out[0];
                 }
                 out
             }
             Kind::Crush => {
-                let c = (amt * y).clamp(0.0, 1.0);
-                if c < 1e-4 {
+                let c = [(amt * y[0]).clamp(0.0, 1.0), (amt * y[1]).clamp(0.0, 1.0)];
+                if c[0] < 1e-4 && c[1] < 1e-4 {
                     return x;
                 }
                 let crunch = db2lin(p.c_crunch);
-                let steps = 2f32.powf(p.c_bits - 1.0);
+                let steps = co.crush_steps;
                 let bits_on = p.c_bits < 15.95;
-                let rate_step = (p.c_rate / sr).min(1.0);
-                let aa = 1.0 - (-2.0 * PI * (p.c_rate * 0.45).min(sr * 0.45) / sr).exp();
-                let lpa = 1.0 - (-2.0 * PI * p.c_lp.min(sr * 0.45) / sr).exp();
                 let mut v = [0.0f32; 2];
                 for ch in 0..2 {
                     let mut s = x[ch];
@@ -1130,52 +1332,48 @@ impl Engine {
                 let bs = &mut self.sh[si].band[b];
                 if p.c_aa {
                     for ch in 0..2 {
-                        bs.aa[0][ch] += (v[ch] - bs.aa[0][ch]) * aa;
-                        bs.aa[1][ch] += (bs.aa[0][ch] - bs.aa[1][ch]) * aa;
+                        bs.aa[0][ch] += (v[ch] - bs.aa[0][ch]) * co.crush_aa;
+                        bs.aa[1][ch] += (bs.aa[0][ch] - bs.aa[1][ch]) * co.crush_aa;
                         v[ch] = bs.aa[1][ch];
                     }
                 }
-                bs.count += rate_step;
-                if bs.count >= 1.0 || rate_step >= 1.0 {
-                    bs.count = (bs.count - 1.0 - jit * rate_step.min(0.5)).max(0.0);
+                bs.count += co.crush_rate;
+                if bs.count >= 1.0 || co.crush_rate >= 1.0 {
+                    bs.count = (bs.count - 1.0 - jit * co.crush_rate.min(0.5)).max(0.0);
                     bs.hold = v;
                 }
                 let mut out = [0.0; 2];
                 for ch in 0..2 {
-                    bs.lp[ch] += (bs.hold[ch] - bs.lp[ch]) * lpa;
+                    bs.lp[ch] += (bs.hold[ch] - bs.lp[ch]) * co.crush_lp;
                     let wet = bs.lp[ch] * p.c_gain;
-                    out[ch] = x[ch] + (wet - x[ch]) * c;
+                    out[ch] = x[ch] + (wet - x[ch]) * c[ch];
                 }
                 out
             }
             Kind::Drive => {
-                let c = (amt * y).clamp(0.0, 1.0);
-                if c < 1e-4 {
-                    return x;
-                }
-                let g = db2lin(p.d_in + c * 36.0);
-                let comp = g.powf(-0.7 * (1.0 - p.d_accent));
-                let push = p.d_push * 0.6;
-                let tone_a = 1.0 - (-2.0 * PI * 1200.0 / sr).exp();
-                let dc_r = 1.0 - 2.0 * PI * 12.0 / sr;
-                let blend = (c * 4.0).min(1.0);
-                let tone = p.d_tone * c;
                 let bs = &mut self.sh[si].band[b];
                 // grip: quiet parts get quieter
                 let lvl = x[0].abs().max(x[1].abs());
                 let ga = if lvl > bs.grip { 0.05 } else { 0.0005 };
                 bs.grip += (lvl - bs.grip) * ga;
                 let grip = if p.d_grip > 0.0 { bs.grip / (bs.grip + p.d_grip * 0.08 + 1e-9) } else { 1.0 };
-                let mut out = [0.0; 2];
+                let push = p.d_push * 0.6;
+                let mut out = x;
                 for ch in 0..2 {
+                    let c = (amt * y[ch]).clamp(0.0, 1.0);
+                    // the filters keep running at zero drive, so nothing jumps when it comes back
+                    let lg = (p.d_in + c * 36.0) * (LN_10 / 20.0);
+                    let g = lg.exp();
+                    let comp = (lg * -0.7 * (1.0 - p.d_accent)).exp();
                     let sat = drive_curve(p.d_style, x[ch] * g + push);
-                    // DC blocker (push and rectify make DC)
                     let (x1, y1) = bs.dc[ch];
-                    let yv = sat - x1 + dc_r * y1;
+                    let yv = sat - x1 + co.dc_r * y1;
                     bs.dc[ch] = (sat, yv);
                     let sat = yv * comp * grip;
-                    bs.lp[ch] += (sat - bs.lp[ch]) * tone_a;
+                    bs.lp[ch] += (sat - bs.lp[ch]) * co.tone_a;
+                    let tone = p.d_tone * c;
                     let toned = if tone < 0.0 { sat + (bs.lp[ch] - sat) * -tone } else { sat + (sat - bs.lp[ch]) * tone };
+                    let blend = (c * 4.0).min(1.0);
                     out[ch] = x[ch] + (toned * p.d_out - x[ch]) * blend;
                 }
                 out
@@ -1183,30 +1381,31 @@ impl Engine {
         }
     }
 
-    fn filter(&mut self, si: usize, b: usize, y: f32, x: [f32; 2], q: &ShaperSet, p: &Settings) -> [f32; 2] {
+    fn filter(&mut self, si: usize, b: usize, y: [f32; 2], x: [f32; 2], q: &ShaperSet, p: &Settings) -> [f32; 2] {
         let sr = self.sr;
-        let ye = 1.0 - q.amount * (1.0 - y);
         let lo = p.f_lo.min(p.f_hi);
         let hi = p.f_hi.max(lo);
-        let f = lo * (hi / lo).powf(ye);
+        let ratio = hi / lo;
         let res = p.f_res;
         let ty = p.f_type;
         use FilterType::*;
         let phaser = matches!(ty, PhN2 | PhN4 | PhN6 | PhN8 | PhP2 | PhP4 | PhP6 | PhP8);
         let k = if phaser { 2.0 * (1.0 - 0.85 * res) } else { 2.0 * (1.0 - res).powf(1.5) + 0.06 };
         let comp = 1.0 - 0.45 * res;
+        let fst = self.co.fstereo;
         let bs = &mut self.sh[si].band[b];
         let mut out = [0.0; 2];
         for ch in 0..2 {
-            // Stereo: the two channels move apart (left up, right down)
-            let sp = if ch == 0 { 0.5 } else { -0.5 } * p.f_stereo;
-            let fc = (f * 2f32.powf(sp / 12.0)).clamp(15.0, 0.47 * sr);
-            let c = match bs.fc[ch] {
-                Some((cf, ck, c)) if (cf - fc).abs() <= fc * 1e-4 && (ck - k).abs() < 1e-6 => c,
+            let ye = 1.0 - q.amount * (1.0 - y[ch]);
+            let fc = (lo * ratio.powf(ye) * fst[ch]).clamp(15.0, 0.47 * sr);
+            // new coefficients only when the cutoff moved by more than 0.2 % (inaudible steps)
+            let (c, c2) = match bs.fc[ch] {
+                Some((cf, ck, c, c2)) if (cf - fc).abs() <= fc * 2e-3 && (ck - k).abs() < 1e-6 => (c, c2),
                 _ => {
                     let c = SvfCoef::new(fc, sr, k);
-                    bs.fc[ch] = Some((fc, k, c));
-                    c
+                    let c2 = SvfCoef::new(fc, sr, SQRT_2.max(k));
+                    bs.fc[ch] = Some((fc, k, c, c2));
+                    (c, c2)
                 }
             };
             let st = &mut bs.svf[ch];
@@ -1225,23 +1424,27 @@ impl Engine {
                     let (l, _, h) = st[0].run(&c, v);
                     (l - h) * comp
                 }
-                Lp24 | Hp24 | Bp24 | Notch24 | Peak24 => {
-                    let c2 = SvfCoef { k: SQRT_2.max(k), ..c };
-                    let c2 = SvfCoef::new(fc, sr, c2.k);
-                    let (l, bp, h) = st[0].run(&c, v);
-                    match ty {
-                        Lp24 => st[1].run(&c2, l).0 * comp,
-                        Hp24 => st[1].run(&c2, h).2 * comp,
-                        Bp24 => st[1].run(&c, bp * c.k).1 * c.k,
-                        Notch24 => {
-                            let (l2, _, h2) = st[1].run(&c, l + h);
-                            l2 + h2
-                        }
-                        _ => {
-                            let (l2, _, h2) = st[1].run(&c, (l - h) * comp);
-                            (l2 - h2) * comp
-                        }
-                    }
+                Lp24 => {
+                    let (l, _, _) = st[0].run(&c, v);
+                    st[1].run(&c2, l).0 * comp
+                }
+                Hp24 => {
+                    let (_, _, h) = st[0].run(&c, v);
+                    st[1].run(&c2, h).2 * comp
+                }
+                Bp24 => {
+                    let (_, bp, _) = st[0].run(&c, v);
+                    st[1].run(&c, bp * c.k).1 * c.k
+                }
+                Notch24 => {
+                    let (l, _, h) = st[0].run(&c, v);
+                    let (l2, _, h2) = st[1].run(&c, l + h);
+                    l2 + h2
+                }
+                Peak24 => {
+                    let (l, _, h) = st[0].run(&c, v);
+                    let (l2, _, h2) = st[1].run(&c, (l - h) * comp);
+                    (l2 - h2) * comp
                 }
                 _ => {
                     let (n, peaks) = match ty {
@@ -1273,435 +1476,5 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::wave::{Preset, Wave};
-    use crate::{Slot, WaveCubeParams};
-    use nih_plug::prelude::Enum;
-
-    fn sine(n: usize, f: f32, sr: f32) -> Vec<f32> {
-        (0..n).map(|i| (2.0 * PI * f * i as f32 / sr).sin() * 0.5).collect()
-    }
-
-    fn run(eng: &mut Engine, p: &Settings, input: &[f32], shared: &Shared) -> Vec<[f32; 2]> {
-        let t = Transport { tempo: 120.0, pos_beats: None, playing: false };
-        let mut out = Vec::with_capacity(input.len());
-        for chunk in input.chunks(256) {
-            eng.begin_block(p, &t, shared);
-            for &x in chunk {
-                out.push(eng.process([x, x], true, None, p, shared));
-            }
-            eng.end_block(shared);
-        }
-        out
-    }
-
-    fn settings() -> Settings {
-        Settings::from_params(&WaveCubeParams::default())
-    }
-
-    fn only(p: &mut Settings, k: Kind) {
-        for (i, s) in p.sh.iter_mut().enumerate() {
-            s.on = i == k.index();
-            s.smooth_ms = 0.0;
-        }
-    }
-
-    fn rms(v: &[[f32; 2]]) -> f32 {
-        (v.iter().map(|s| s[0] * s[0]).sum::<f32>() / v.len() as f32).sqrt()
-    }
-
-    #[test]
-    fn everything_off_is_transparent() {
-        let mut p = settings();
-        for s in p.sh.iter_mut() {
-            s.on = false;
-        }
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&State::default());
-        let x = sine(4800, 440.0, 48000.0);
-        let y = run(&mut e, &p, &x, &shared);
-        for (a, b) in x.iter().zip(y.iter()) {
-            assert!((a - b[0]).abs() < 1e-6 && (a - b[1]).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn neutral_shapes_are_transparent() {
-        let mut p = settings();
-        let mut st = State::default();
-        for (i, k) in Kind::ALL.iter().enumerate() {
-            let y = match k {
-                Kind::Noise | Kind::Crush | Kind::Drive => 0.0,
-                Kind::Pan | Kind::Width => 0.5,
-                _ => 1.0,
-            };
-            st.waves[i] = vec![Wave::flat(y); N_BANDS];
-            p.sh[i].on = *k != Kind::Filter;
-        }
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let x = sine(9600, 440.0, 48000.0);
-        let y = run(&mut e, &p, &x, &shared);
-        for (a, b) in x.iter().zip(y.iter()).skip(10) {
-            assert!((a - b[0]).abs() < 1e-4, "{a} {}", b[0]);
-        }
-    }
-
-    #[test]
-    fn volume_follows_the_shape() {
-        let mut p = settings();
-        only(&mut p, Kind::Volume);
-        let mut st = State::default();
-        st.waves[0][0] = Wave::preset(Preset::Square);
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let x = vec![0.5f32; 24000];
-        let y = run(&mut e, &p, &x, &shared);
-        assert!((y[6000][0] - 0.5).abs() < 1e-4);
-        assert!(y[18000][0].abs() < 1e-4);
-    }
-
-    #[test]
-    fn compressor_pulls_loud_parts_down() {
-        let mut p = settings();
-        only(&mut p, Kind::Volume);
-        p.v_comp = true;
-        p.v_thr = -20.0;
-        p.v_ratio = 4.0;
-        p.v_auto = false;
-        let mut st = State::default();
-        st.waves[0][0] = Wave::flat(1.0);
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let x = sine(48000, 200.0, 48000.0); // peak 0.5 = -6 dBFS: 14 dB over, 10.5 dB less
-        let y = run(&mut e, &p, &x, &shared);
-        let pk = y[24000..].iter().map(|v| v[0].abs()).fold(0.0, f32::max);
-        let db = 20.0 * (pk / 0.5).log10();
-        assert!((-12.5..-8.5).contains(&db), "{db}");
-    }
-
-    #[test]
-    fn three_bands_sum_flat() {
-        let mut p = settings();
-        only(&mut p, Kind::Volume);
-        p.sh[0].multiband = true;
-        let mut st = State::default();
-        st.waves[0] = vec![Wave::flat(1.0); N_BANDS];
-        let shared = Shared::default();
-        for f in [60.0, 200.0, 700.0, 2500.0, 9000.0] {
-            let mut e = Engine::new(48000.0);
-            e.bake(&st);
-            let x = sine(48000, f, 48000.0);
-            let y = run(&mut e, &p, &x, &shared);
-            let pin = x[24000..].iter().map(|v| v * v).sum::<f32>();
-            let pout = y[24000..].iter().map(|v| v[0] * v[0]).sum::<f32>();
-            let db = 10.0 * (pout / pin).log10();
-            assert!(db.abs() < 0.1, "{f} Hz: {db} dB");
-        }
-    }
-
-    #[test]
-    fn solo_plays_one_band() {
-        let mut p = settings();
-        only(&mut p, Kind::Volume);
-        p.sh[0].multiband = true;
-        let mut st = State::default();
-        st.waves[0] = vec![Wave::flat(1.0); N_BANDS];
-        let shared = Shared::default();
-        shared.solo[0].store(0b100, Ordering::Relaxed); // high band only
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let y = run(&mut e, &p, &sine(24000, 80.0, 48000.0), &shared);
-        assert!(rms(&y[12000..]) < 0.01);
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let y = run(&mut e, &p, &sine(24000, 9000.0, 48000.0), &shared);
-        assert!(rms(&y[12000..]) > 0.3);
-    }
-
-    #[test]
-    fn every_filter_type_closes_or_passes_sensibly() {
-        let shared = Shared::default();
-        for t in 0..FilterType::variants().len() {
-            let ty = FilterType::from_index(t);
-            let mut p = settings();
-            only(&mut p, Kind::Filter);
-            p.f_type = ty;
-            p.f_lo = 200.0;
-            p.f_res = 0.0;
-            let mut st = State::default();
-            st.waves[1][0] = Wave::flat(0.0); // cutoff at 200 Hz
-            let mut e = Engine::new(48000.0);
-            e.bake(&st);
-            let hi = run(&mut e, &p, &sine(24000, 6000.0, 48000.0), &shared);
-            let mut e = Engine::new(48000.0);
-            e.bake(&st);
-            let lo = run(&mut e, &p, &sine(24000, 30.0, 48000.0), &shared);
-            let (h, l) = (rms(&hi[12000..]), rms(&lo[12000..]));
-            assert!(h.is_finite() && l.is_finite());
-            use FilterType::*;
-            match ty {
-                Lp6 => assert!(h < 0.05, "{ty:?} {h}"),
-                Lp12 | Lp24 => assert!(h < 0.01, "{ty:?} {h}"),
-                Hp12 | Hp24 => assert!(l < 0.03, "{ty:?} {l}"),
-                Hp6 => assert!(l < 0.12, "{ty:?} {l}"),
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
-    fn envelope_opens_the_filter() {
-        let shared = Shared::default();
-        let mut p = settings();
-        only(&mut p, Kind::Filter);
-        p.f_lo = 200.0;
-        p.sh[1].env_on = true;
-        p.sh[1].env_amt = 1.0;
-        let mut st = State::default();
-        st.waves[1][0] = Wave::flat(0.0);
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let y = run(&mut e, &p, &sine(24000, 5000.0, 48000.0), &shared);
-        // the loud input pushes the cutoff up: 5 kHz gets through
-        assert!(rms(&y[12000..]) > 0.15, "{}", rms(&y[12000..]));
-    }
-
-    #[test]
-    fn time_delays_by_the_shape() {
-        let mut p = settings();
-        only(&mut p, Kind::Time);
-        let mut st = State::default();
-        st.waves[4][0] = Wave::flat(0.5);
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let mut x = vec![0.0f32; 96000];
-        x[1000] = 1.0;
-        let y = run(&mut e, &p, &x, &shared);
-        let at = y.iter().position(|v| v[0] > 0.5).unwrap();
-        assert!((at as i64 - 49000).abs() < 3, "{at}");
-    }
-
-    #[test]
-    fn noise_only_outputs_noise() {
-        let mut p = settings();
-        only(&mut p, Kind::Noise);
-        p.n_only = true;
-        let mut st = State::default();
-        st.waves[5][0] = Wave::flat(1.0);
-        let shared = Shared::default();
-        for t in 0..NoiseType::variants().len() {
-            p.n_type = NoiseType::from_index(t);
-            let mut e = Engine::new(48000.0);
-            e.bake(&st);
-            let y = run(&mut e, &p, &vec![0.0; 24000], &shared);
-            let r = rms(&y[4000..]);
-            assert!(r > 0.003 && r < 0.6, "{:?} {r}", p.n_type);
-        }
-    }
-
-    #[test]
-    fn crush_and_drive_change_the_sound_and_stay_bounded() {
-        let shared = Shared::default();
-        let x = sine(24000, 220.0, 48000.0);
-        let mut p = settings();
-        only(&mut p, Kind::Crush);
-        p.c_bits = 3.0;
-        let mut st = State::default();
-        st.waves[6][0] = Wave::flat(1.0);
-        st.waves[7][0] = Wave::flat(1.0);
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let y = run(&mut e, &p, &x, &shared);
-        let diff = x.iter().zip(y.iter()).map(|(a, b)| (a - b[0]).abs()).fold(0.0, f32::max);
-        assert!(diff > 0.05);
-        for s in 0..DriveStyle::variants().len() {
-            let mut p = settings();
-            only(&mut p, Kind::Drive);
-            p.d_style = DriveStyle::from_index(s);
-            p.d_push = 0.7;
-            let mut e = Engine::new(48000.0);
-            e.bake(&st);
-            let y = run(&mut e, &p, &x, &shared);
-            let pk = y.iter().map(|v| v[0].abs()).fold(0.0, f32::max);
-            assert!(pk.is_finite() && pk < 2.5 && pk > 0.01, "{:?} {pk}", p.d_style);
-        }
-    }
-
-    #[test]
-    fn pan_moves_left_and_haas_delays() {
-        let shared = Shared::default();
-        let mut p = settings();
-        only(&mut p, Kind::Pan);
-        let mut st = State::default();
-        st.waves[2][0] = Wave::flat(1.0); // fully left
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let y = run(&mut e, &p, &sine(4800, 440.0, 48000.0), &shared);
-        assert!(y[2000][1].abs() < 1e-6);
-        p.p_haas = 1.0;
-        p.p_haas_ms = 10.0;
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let mut x = vec![0.0; 4800];
-        x[100] = 1.0;
-        let y = run(&mut e, &p, &x, &shared);
-        let l = y.iter().position(|v| v[0] > 0.5).unwrap();
-        let r = y.iter().position(|v| v[1] > 0.5).unwrap();
-        assert_eq!(l, 100);
-        assert!((r as i64 - 580).abs() <= 1, "{r}");
-    }
-
-    #[test]
-    fn midi_restarts_and_one_shot_holds() {
-        let mut p = settings();
-        p.sh[0].trigger = Trigger::MidiOnce;
-        p.sh[0].beats = 0.25;
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&State::default());
-        let t = Transport { tempo: 120.0, pos_beats: None, playing: false };
-        e.begin_block(&p, &t, &shared);
-        e.process([0.1; 2], true, Some(60), &p, &shared);
-        assert!(e.sh[0].phase < 0.001);
-        for _ in 0..20000 {
-            e.process([0.1; 2], true, None, &p, &shared);
-        }
-        // 1/16 at 120 = 6000 samples: long done, holding the end
-        assert!(e.sh[0].done);
-        e.process([0.1; 2], true, Some(62), &p, &shared);
-        assert!(!e.sh[0].done && e.sh[0].phase < 0.001);
-    }
-
-    #[test]
-    fn pitch_mode_runs_at_the_note() {
-        let mut p = settings();
-        p.sh[0].mode = Mode::Pitch;
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        let t = Transport { tempo: 120.0, pos_beats: None, playing: false };
-        e.begin_block(&p, &t, &shared);
-        e.process([0.0; 2], true, Some(69), &p, &shared);
-        assert!((e.sh[0].inc - 440.0 / 48000.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn midi_switch_loads_user_waves() {
-        let mut p = settings();
-        only(&mut p, Kind::Volume);
-        p.midi_switch = true;
-        let mut st = State::default();
-        st.waves[0][0] = Wave::flat(1.0);
-        st.slots[1] = Some(Slot { shaper: 0, band: 0, wave: Wave::flat(0.0) }); // D
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        e.bake(&st);
-        let t = Transport { tempo: 120.0, pos_beats: None, playing: false };
-        e.begin_block(&p, &t, &shared);
-        let a = e.process([0.5; 2], true, None, &p, &shared);
-        assert!((a[0] - 0.5).abs() < 1e-4);
-        e.process([0.5; 2], true, Some(62), &p, &shared);
-        let b = e.process([0.5; 2], true, None, &p, &shared);
-        assert!(b[0].abs() < 1e-4, "{}", b[0]);
-        assert_eq!(shared.switched.load(Ordering::Relaxed) & 0xff, 1);
-    }
-
-    #[test]
-    fn sync_follows_the_song_position() {
-        let p = settings();
-        let shared = Shared::default();
-        let mut e = Engine::new(48000.0);
-        let t = Transport { tempo: 120.0, pos_beats: Some(10.25), playing: true };
-        e.begin_block(&p, &t, &shared);
-        assert!((e.sh[0].phase - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn fuzz_never_explodes() {
-        let shared = Shared::default();
-        let mut rng = Rng(77);
-        let mut st = State::default();
-        for s in 0..N_SHAPERS {
-            for b in 0..N_BANDS {
-                st.waves[s][b] = Wave::steps(&(0..16).map(|_| rng.uni()).collect::<Vec<_>>());
-            }
-        }
-        for round in 0..10 {
-            let mut p = settings();
-            for s in p.sh.iter_mut() {
-                s.on = true;
-                s.multiband = round % 2 == 1;
-                s.smooth_ms = (round as f32) * 3.0;
-                s.mode = [Mode::Beat, Mode::Hz, Mode::Pitch][round % 3];
-                s.trigger = Trigger::from_index(round % 5);
-                s.hz = 7.0;
-                s.env_on = round % 3 == 0;
-                s.env_mult = round % 4 == 0;
-                s.env_amt = if round % 2 == 0 { 2.0 } else { -2.0 };
-            }
-            p.v_comp = true;
-            p.v_ratio = 100.0;
-            p.f_res = 1.0;
-            p.f_stereo = 60.0;
-            p.f_type = FilterType::from_index((round * 2) % FilterType::variants().len());
-            p.d_style = DriveStyle::from_index(round % 10);
-            p.d_in = 36.0;
-            p.d_push = 1.0;
-            p.d_grip = 1.0;
-            p.c_crunch = 27.0;
-            p.c_bits = 1.0;
-            p.c_jitter = 1.0;
-            p.c_rate = 9.0;
-            p.n_type = NoiseType::from_index(round % 8);
-            p.p_haas = 1.0;
-            p.p_haas_ms = 40.0;
-            p.t_range = TimeRange::from_index(round % 8);
-            let mut e = Engine::new(44100.0);
-            e.bake(&st);
-            let x: Vec<f32> = (0..30000).map(|_| rng.next()).collect();
-            let t = Transport { tempo: 140.0, pos_beats: None, playing: false };
-            let mut ok = true;
-            for (i, chunk) in x.chunks(128).enumerate() {
-                e.begin_block(&p, &t, &shared);
-                for (j, &v) in chunk.iter().enumerate() {
-                    let note = if (i * 128 + j) % 3000 == 0 { Some(((i + j) % 128) as u8) } else { None };
-                    let o = e.process([v, -v], true, note, &p, &shared);
-                    ok &= o[0].is_finite() && o[1].is_finite() && o[0].abs() < 40.0 && o[1].abs() < 40.0;
-                }
-                e.end_block(&shared);
-            }
-            assert!(ok, "round {round}");
-        }
-    }
-
-    #[test]
-    fn cheap_enough_with_everything_on() {
-        let shared = Shared::default();
-        let mut p = settings();
-        for s in p.sh.iter_mut() {
-            s.on = true;
-            s.multiband = true;
-            s.env_on = true;
-        }
-        p.v_comp = true;
-        p.f_type = FilterType::PhN8;
-        p.p_haas = 0.5;
-        let mut e = Engine::new(48000.0);
-        e.bake(&State::default());
-        let x = sine(48000, 220.0, 48000.0);
-        let t0 = std::time::Instant::now();
-        let y = run(&mut e, &p, &x, &shared);
-        let dt = t0.elapsed().as_secs_f64();
-        eprintln!("1 s of audio, 8 shapers x 3 bands, everything on: {:.1} ms", dt * 1000.0);
-        assert!(y.len() == 48000);
-        if !cfg!(debug_assertions) {
-            assert!(dt < 0.35, "{dt}");
-        }
-    }
-}
+#[path = "dsp_tests.rs"]
+mod tests;

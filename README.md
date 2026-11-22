@@ -17,7 +17,7 @@ Draw a shape and let volume, filter, pan, width, time, noise, crush and drive fo
 
 <p align="center"><img src="docs/img/wavecube.png" alt="WaveCube" width="880"></p>
 
-Eight shapers in one chain you can reorder. Each one has its own drawn LFO shape, its own timing, an envelope follower (Volume: a compressor) and, if you want, three bands with a shape and settings for each. Sidechain pumping without a sidechain, gates, wobbles, phasers, auto-pan, Haas swirls, mono bass, tape stops, half-time, scratches, risers, vinyl, bit crush and fold distortion.
+Up to eight shapers in one chain: add the ones you need with **+**, remove them with **×**, drag the tabs to change the order. Each one has its own drawn LFO shape, its own timing, an envelope follower (Volume: a compressor) and, if you want, three bands with a shape and settings for each. Sidechain pumping without a sidechain, gates, wobbles, phasers, auto-pan, Haas swirls, mono bass, tape stops, half-time, scratches, risers, vinyl, bit crush and fold distortion.
 
 ## Shapers
 
@@ -32,7 +32,9 @@ Eight shapers in one chain you can reorder. Each one has its own drawn LFO shape
 | **Crush** | crushed / clean | Crunch (wave wrap), Push, Bits (16-1), Dither, Resample (44.1 kHz - 8.8 Hz), Jitter, Anti-alias, Low-pass, Gain |
 | **Drive** | driven / clean | 10 styles (soft / hard clip, square, rectify, skew / sine / triangle / extreme fold), Input, Output, Push, Grip, Accent, Tone |
 
-Every shaper: **on / off** (the dot on its tab), **Mix**, **Smooth**, **Multiband** (two splits, a shape per band, **S** = solo), **Quick presets** (Init + three ready setups). Filter, Pan, Width, Noise, Crush and Drive have an **envelope follower** (Amount ±200 %, Attack, Hold, Release, Threshold; Filter / Width: Add or Multiply).
+Every shaper: **on / off** (the dot on its tab), **Mix**, **Smooth**, **Multiband** (two splits, a shape per band, **S** = solo), **Quick presets** (Init + three ready setups). Filter, Pan, Width, Noise, Crush and Drive have an **envelope follower** (Amount ±200 %, Attack, Hold, Release, Threshold; Filter / Width: Add or Multiply) that can listen to the signal or to the **sidechain input (SC)**; the Volume compressor can be keyed by the sidechain too (kick ducking without a separate plugin).
+
+Switching, adding or removing a shaper and loading presets fade over 8 ms, and Amount, Mix and the gains are smoothed: no clicks.
 
 ## The shape editor
 
@@ -49,9 +51,13 @@ Every shaper: **on / off** (the dot on its tab), **Mix**, **Smooth**, **Multiban
 
 **Mode**: Beat (tempo and song position), Hz (0.02 Hz - 5 kHz), Pitch (speed = the MIDI note played). **Trigger**: Free, MIDI, MIDI 1-shot, Audio, Audio 1-shot (1-shot plays once and holds the end). **Length** 1/128 to 32 bars, straight / dotted / triplet, **Phase**.
 
+Extras: **Swing** delays every second grid step (groove for gates and steps). **Stereo** offsets the right channel's position in the shape by up to 180° (stereo tremolo, wide wobbles, ping-pong gates; Volume, Filter, Time, Noise, Crush, Drive); the editor shows the right channel's playhead as a hollow dot.
+
+<p align="center"><img src="docs/img/wavecube-stereo.png" alt="Stereo wobble" width="880"></p>
+
 ## Presets
 
-Click the preset name for the browser: search, All / Favourites / Factory / User and nine categories, the shapers each preset uses, ★ to mark favourites, ✕ to delete your own. **◀ ▶** step through the current list, **SAVE** stores the whole plugin (every control, all shapes, user waves). 38 factory presets. User presets are JSON files in:
+Click the preset name for the browser: search, All / Favourites / Factory / User and nine categories, the shapers each preset uses, ★ to mark favourites, ✕ to delete your own. **◀ ▶** step through the current list, **SAVE** stores the whole plugin (every control, all shapes, user waves, the chain). **A / B** keeps two complete settings to compare (Shift-click copies the current one into a slot). 42 factory presets. ⚙: window size 75-200 %, open the preset folder. User presets are JSON files in:
 
 | OS | Folder |
 |---|---|
@@ -61,21 +67,25 @@ Click the preset name for the browser: search, All / Favourites / Factory / User
 
 <p align="center"><img src="docs/img/wavecube-presets.png" alt="Presets" width="880"></p>
 
+**Output**: Input, Master mix, Output, and **Clip**, a safety clipper that is transparent below -1 dBFS and never lets the plugin go over 0 dBFS (on by default).
+
 ## How it works
 
 ```
-input → Input → shaper → shaper → … (your order) → Master mix → Output
+input → Input → shaper → shaper → … (your order) → Master mix → Output → Clip
 shaper: LFO (song position / Hz / note pitch; restarted by MIDI or audio hits; 1-shot)
-        → drawn shape (2048-point table) → Smooth → + envelope follower
+        → swing, stereo offset → drawn shape (2048-point table) → Smooth → + envelope follower
         → full band, or Linkwitz-Riley 24 dB/oct split into 3 bands (flat sum, solo)
         → effect per band → shaper Mix
 ```
 
-No latency.
+No latency. The plugin has a stereo sidechain input ("Sidechain") for the envelope followers and the compressor.
 
 ## Tested
 
-`cargo test -p wavecube` (35 tests): everything off is bit-exact, neutral shapes are transparent; Volume follows the shape; the compressor reduces by the ratio; the three bands sum flat within 0.1 dB, solo plays one band; every filter type closes / opens where it should; the envelope opens the filter; Time delays by exactly the drawn amount; Pan and Haas; every noise type; every drive style stays bounded; MIDI restarts, 1-shot holds, Pitch mode runs at the note, MIDI Switch loads user waves; Beat mode lands on the song position; all factory and quick presets are valid and survive a save / load; fuzzing every mode at extreme settings never blows up. All 8 shapers × 3 bands with everything on: about 10 % of one core.
+`cargo test -p wavecube` (44 tests): everything off is bit-exact, removed shapers do nothing, neutral shapes are transparent; switching shapers, Amount / Mix / gain changes do not click; Volume follows the shape; the compressor reduces by the ratio and listens to the sidechain; the three bands sum flat within 0.1 dB, solo plays one band; every filter type closes / opens where it should and fast resonant sweeps stay smooth; the envelope opens the filter; Time delays by exactly the drawn amount, stays clean at delays of a few samples and never replays old audio after a restart; Pan and Haas; stereo offset and swing; the safety clipper; every noise type; every drive style stays bounded; MIDI restarts, 1-shot holds, Pitch mode runs at the note, MIDI Switch loads user waves; Beat mode lands on the song position; all factory and quick presets are valid and survive a save / load; fuzzing every mode at extreme settings never blows up.
+
+CPU (one core, 48 kHz): a single shaper about 0.3 %; all 8 shapers × 3 bands with envelopes, stereo offset, swing, an 8-notch phaser and Haas on: about 11 %.
 
 ## Installation
 

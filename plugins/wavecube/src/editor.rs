@@ -65,17 +65,32 @@ struct Library {
     factory: Vec<PresetData>,
     user: Vec<PresetData>,
     favs: Vec<String>,
+    /// quick presets per shaper, built once
+    quick: Vec<Vec<(&'static str, PresetData)>>,
 }
 
 impl Library {
     fn load() -> Self {
-        Self { factory: presets::factory(), user: presets::list_user(), favs: presets::load_favorites() }
+        Self {
+            factory: presets::factory(),
+            user: presets::list_user(),
+            favs: presets::load_favorites(),
+            quick: Kind::ALL.iter().map(|&k| presets::quick(k)).collect(),
+        }
+    }
+    /// (is_user, index) of every preset
+    fn entries(&self) -> impl Iterator<Item = (bool, usize)> + '_ {
+        (0..self.factory.len()).map(|i| (false, i)).chain((0..self.user.len()).map(|i| (true, i)))
+    }
+    fn get(&self, user: bool, i: usize) -> &PresetData {
+        if user {
+            &self.user[i]
+        } else {
+            &self.factory[i]
+        }
     }
     fn key(user: bool, name: &str) -> String {
         format!("{}:{name}", if user { "U" } else { "F" })
-    }
-    fn all(&self) -> Vec<(bool, &PresetData)> {
-        self.factory.iter().map(|p| (false, p)).chain(self.user.iter().map(|p| (true, p))).collect()
     }
 }
 
@@ -101,6 +116,10 @@ struct Gui {
     status: Option<(String, f64)>,
     last_switch: u32,
     seed: u32,
+    tab_drag: Option<usize>,
+    save_focus: bool,
+    ab: [Option<PresetData>; 2],
+    ab_cur: usize,
 }
 
 fn set_norm<P: Param>(setter: &ParamSetter, p: &P, v: f32) {
@@ -177,6 +196,42 @@ fn combo(ui: &mut Ui, id: &str, rect: Rect, names: &[&str], idx: usize, shown: &
             });
         if !tip.is_empty() {
             r.response.on_hover_text(tip);
+        }
+    });
+    pick
+}
+
+/// A button that opens a menu below it; returns the picked item. Items starting with "──" are headings.
+fn menu_btn(ui: &mut Ui, id: &str, rect: Rect, label: &str, items: &[(String, Color32)], col: Color32, tip: &str, font: f32) -> Option<usize> {
+    let popup_id = egui::Id::new(("menu", id));
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let resp = ui.allocate_rect(rect, Sense::click());
+    let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
+    let p = ui.painter();
+    let hov = resp.hovered() || open;
+    p.rect_filled(rect, CornerRadius::same(6), if hov { PANEL2 } else { PANEL });
+    p.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0f32, if open { col } else if hov { FAINT } else { LINE }), StrokeKind::Inside);
+    p.text(rect.center(), Align2::CENTER_CENTER, label, pf(font), if hov { col } else { DIM });
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    let mut pick = None;
+    egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(150.0);
+        for (i, (name, c)) in items.iter().enumerate() {
+            if let Some(h) = name.strip_prefix("──") {
+                ui.label(egui::RichText::new(h.trim()).font(pf(10.5)).color(DIM));
+                continue;
+            }
+            let (r, ir) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(150.0), 24.0), Sense::click());
+            if ir.hovered() {
+                ui.painter().rect_filled(r, CornerRadius::same(4), PANEL);
+            }
+            ui.painter().circle_filled(r.left_center() + Vec2::new(10.0, 0.0), 4.0, *c);
+            ui.painter().text(r.left_center() + Vec2::new(22.0, 0.0), Align2::LEFT_CENTER, name, pf(12.5), TEXT);
+            if ir.clicked() {
+                pick = Some(i);
+            }
         }
     });
     pick
@@ -497,6 +552,10 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
             status: None,
             last_switch: 0,
             seed: 1,
+            tab_drag: None,
+            save_focus: false,
+            ab: [None, None],
+            ab_cur: 0,
         },
         |ctx, _| {
             let mut v = egui::Visuals::dark();
@@ -598,6 +657,9 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
                 (z && !i.modifiers.shift, (z && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::Y)))
             });
+            // typing in a text field: no shortcuts
+            let typing = ctx.wants_keyboard_input();
+            let (undo_key, redo_key) = (undo_key && !typing, redo_key && !typing);
 
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(ctx, |ui| {
                 let full = ui.max_rect();
@@ -617,37 +679,36 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 logo(ui, at(30.0, 29.0), 14.0);
                 painter.text(at(52.0, 29.0), Align2::LEFT_CENTER, "WaveCube", FontId::proportional(21.0), TEXT);
 
-                // preset bar
+                // preset bar (indices into the library: nothing is copied per frame)
                 let lib = gui.lib.as_ref().unwrap();
-                let filtered: Vec<(bool, PresetData)> = {
+                let filtered: Vec<(bool, usize)> = {
                     let q = gui.search.to_lowercase();
-                    lib.all()
-                        .into_iter()
-                        .filter(|(u, d)| {
+                    lib.entries()
+                        .filter(|&(u, i)| {
+                            let d = lib.get(u, i);
                             let cat_ok = match gui.filter {
                                 0 => true,
-                                1 => lib.favs.contains(&Library::key(*u, &d.name)),
-                                2 => !*u,
-                                3 => *u,
-                                i => d.category == CATEGORIES[(i - 4).min(CATEGORIES.len() - 1)],
+                                1 => lib.favs.contains(&Library::key(u, &d.name)),
+                                2 => !u,
+                                3 => u,
+                                f => d.category == CATEGORIES[(f - 4).min(CATEGORIES.len() - 1)],
                             };
                             cat_ok && (q.is_empty() || d.name.to_lowercase().contains(&q))
                         })
-                        .map(|(u, d)| (u, d.clone()))
                         .collect()
                 };
-                let cur_idx = filtered.iter().position(|(_, d)| d.name == st.preset);
-                let cat = lib.all().into_iter().find(|(_, d)| d.name == st.preset).map(|(_, d)| d.category.clone()).unwrap_or_default();
+                let cur_idx = filtered.iter().position(|&(u, i)| lib.get(u, i).name == st.preset);
+                let cat = lib.entries().map(|(u, i)| lib.get(u, i)).find(|d| d.name == st.preset).map(|d| d.category.clone()).unwrap_or_default();
                 let cur_is_user = lib.user.iter().any(|d| d.name == st.preset);
                 let cur_key = Library::key(cur_is_user, &st.preset);
                 let cur_fav = lib.favs.contains(&cur_key);
-                let px0 = 262.0;
+                let px0 = 226.0;
                 let mut load: Option<PresetData> = None;
-                if btn(ui, rect(px0, 16.0, 28.0, 26.0), "◀", false, col, "Previous preset").clicked() && !filtered.is_empty() {
+                if btn(ui, rect(px0, 16.0, 28.0, 26.0), "◀", false, col, "Previous preset").clicked() && !filtered.is_empty() && !modal {
                     let i = cur_idx.map(|i| (i + filtered.len() - 1) % filtered.len()).unwrap_or(0);
-                    load = Some(filtered[i].1.clone());
+                    load = Some(lib.get(filtered[i].0, filtered[i].1).clone());
                 }
-                let nr = rect(px0 + 32.0, 16.0, 300.0, 26.0);
+                let nr = rect(px0 + 32.0, 16.0, 290.0, 26.0);
                 let nresp = ui.allocate_rect(nr, Sense::click()).on_hover_text("Open the preset browser");
                 painter.rect_filled(nr, CornerRadius::same(5), if nresp.hovered() || gui.browser { PANEL2 } else { EDIT_BG });
                 painter.rect_stroke(nr, CornerRadius::same(5), Stroke::new(1.0f32, if gui.browser { col } else { LINE }), StrokeKind::Inside);
@@ -656,6 +717,10 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 }
                 painter.text(nr.center() + Vec2::new(if cat.is_empty() { 0.0 } else { 24.0 }, 0.0), Align2::CENTER_CENTER, &st.preset, pf(13.0), TEXT);
                 painter.text(nr.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, if gui.browser { "▴" } else { "▾" }, pf(11.0), DIM);
+                if btn(ui, rect(px0 + 326.0, 16.0, 28.0, 26.0), "▶", false, col, "Next preset").clicked() && !filtered.is_empty() && !modal {
+                    let i = cur_idx.map(|i| (i + 1) % filtered.len()).unwrap_or(0);
+                    load = Some(lib.get(filtered[i].0, filtered[i].1).clone());
+                }
                 if nresp.clicked() {
                     gui.browser = !gui.browser;
                     gui.save_open = false;
@@ -665,27 +730,54 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                         }
                     }
                 }
-                if btn(ui, rect(px0 + 336.0, 16.0, 28.0, 26.0), "▶", false, col, "Next preset").clicked() && !filtered.is_empty() {
-                    let i = cur_idx.map(|i| (i + 1) % filtered.len()).unwrap_or(0);
-                    load = Some(filtered[i].1.clone());
-                }
-                if btn(ui, rect(px0 + 370.0, 16.0, 56.0, 26.0), "SAVE", gui.save_open, col, "Save the whole plugin as a preset").clicked() {
+                if btn(ui, rect(px0 + 360.0, 16.0, 56.0, 26.0), "SAVE", gui.save_open, col, "Save the whole plugin as a preset").clicked() {
                     gui.save_open = !gui.save_open;
+                    gui.save_focus = gui.save_open;
                     gui.browser = false;
                     if gui.save_name.is_empty() || gui.save_name == "Init" {
                         gui.save_name = if st.preset == "Init" { String::new() } else { st.preset.clone() };
                     }
                 }
-                {
-                    let (key, fav) = (cur_key.clone(), cur_fav);
-                    if btn(ui, rect(px0 + 430.0, 16.0, 30.0, 26.0), if fav { "★" } else { "☆" }, false, col, "Favourite").clicked() {
-                        let l = gui.lib.as_mut().unwrap();
-                        if fav {
-                            l.favs.retain(|f| f != &key);
-                        } else {
-                            l.favs.push(key);
+                if btn(ui, rect(px0 + 420.0, 16.0, 30.0, 26.0), if cur_fav { "★" } else { "☆" }, false, col, "Favourite").clicked() {
+                    let l = gui.lib.as_mut().unwrap();
+                    if cur_fav {
+                        l.favs.retain(|f| f != &cur_key);
+                    } else {
+                        l.favs.push(cur_key.clone());
+                    }
+                    presets::save_favorites(&l.favs);
+                }
+                // A / B: two complete settings to compare
+                for (i, name) in ["A", "B"].iter().enumerate() {
+                    let r = rect(px0 + 460.0 + i as f32 * 32.0, 16.0, 30.0, 26.0);
+                    let tip = "A / B: two complete settings to compare.\nClick the other letter to switch (the first switch copies the current settings).\nShift-click: copy the current settings into that slot.";
+                    if btn(ui, r, name, gui.ab_cur == i, GOLD, tip).clicked() && !modal {
+                        let shift = ui.input(|k| k.modifiers.shift);
+                        let now_state = presets::capture(p, &st.preset, "");
+                        if shift {
+                            gui.ab[i] = Some(now_state);
+                        } else if gui.ab_cur != i {
+                            let cur = gui.ab_cur;
+                            gui.ab[cur] = Some(now_state.clone());
+                            let target = gui.ab[i].clone().unwrap_or(now_state);
+                            gui.ab[i] = Some(target.clone());
+                            gui.ab_cur = i;
+                            load = Some(target);
                         }
-                        presets::save_favorites(&l.favs);
+                    }
+                }
+                // settings
+                {
+                    let items: Vec<(String, Color32)> = ["── Window size", "75 %", "100 %", "125 %", "150 %", "200 %", "── Presets", "Open the preset folder"].iter().map(|s| (s.to_string(), FAINT)).collect();
+                    if let Some(i) = menu_btn(ui, "settings", rect(px0 + 530.0, 16.0, 34.0, 26.0), "⚙", &items, col, "Window size, preset folder.", 15.0).map(|i| if i < 6 { i - 1 } else { 5 }) {
+                        if i < 5 {
+                            let f = [0.75, 1.0, 1.25, 1.5, 2.0][i];
+                            size_state.set_requested_size(((BASE_W * f) as u32, (BASE_H * f) as u32));
+                        } else if let Some(d) = presets::dir() {
+                            let _ = std::fs::create_dir_all(&d);
+                            let cmd = if cfg!(target_os = "windows") { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                            let _ = std::process::Command::new(cmd).arg(&d).spawn();
+                        }
                     }
                 }
                 if let Some(d) = load.take() {
@@ -701,41 +793,70 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 }
                 hmeter(ui, rect(BASE_W - 14.0 - 80.0 - 14.0 - 110.0, 18.0, 110.0, 7.0), gui.in_lv, "IN");
                 hmeter(ui, rect(BASE_W - 14.0 - 80.0 - 14.0 - 110.0, 33.0, 110.0, 7.0), gui.out_lv, "OUT");
-                painter.text(at(BASE_W - 14.0 - 80.0 - 14.0 - 110.0 - 34.0, 29.0), Align2::RIGHT_CENTER, format!("{:.1} BPM", tempo), pf(11.5), DIM);
 
-                // ================= chain tabs
+                // ================= chain tabs: only the shapers in the chain; drag to reorder
                 let ty = 58.0;
                 let th = 52.0;
                 let gap = 6.0;
-                let tw = (BASE_W - 28.0 - gap * (N_SHAPERS as f32 - 1.0)) / N_SHAPERS as f32;
-                for (pos, &si) in st.order.iter().enumerate() {
-                    let si = si as usize;
+                let plus_w = 44.0;
+                let tw = (BASE_W - 28.0 - plus_w - gap * N_SHAPERS as f32) / N_SHAPERS as f32;
+                let chain: Vec<usize> = st.order.iter().map(|&i| i as usize).filter(|&i| st.present[i]).collect();
+                let slot_x = |pos: usize| 14.0 + pos as f32 * (tw + gap);
+                let pointer = ui.input(|i| i.pointer.interact_pos());
+                let drop_pos = match (gui.tab_drag, pointer) {
+                    (Some(_), Some(pp)) => Some((((pp.x - o.x - 14.0) / (tw + gap)).floor().max(0.0) as usize).min(chain.len().saturating_sub(1))),
+                    _ => None,
+                };
+                let mut remove: Option<usize> = None;
+                for (pos, &si) in chain.iter().enumerate() {
                     let k = Kind::ALL[si];
                     let kcol = kc(k);
-                    let r = rect(14.0 + pos as f32 * (tw + gap), ty, tw, th);
+                    let r = rect(slot_x(pos), ty, tw, th);
                     let on = p.sh[si].on.value();
                     let is_sel = si == sel;
+                    let dragging_me = gui.tab_drag == Some(si);
+                    // the tab first, the small buttons after it (the later one gets the click)
+                    let resp = ui.interact(r, egui::Id::new(("tab", si)), Sense::click_and_drag()).on_hover_text(format!("{}: {}\nDrag to move it in the chain.", k.name(), k.about()));
                     let dot = Rect::from_center_size(Pos2::new(r.right() - 14.0, r.top() + 15.0), Vec2::splat(16.0));
                     let dresp = ui.allocate_rect(dot, Sense::click()).on_hover_text(if on { "Switch off" } else { "Switch on" });
-                    let resp = ui.interact(r, egui::Id::new(("tab", si)), Sense::click()).on_hover_text(format!("{}: {}", k.name(), k.about()));
+                    let xr = Rect::from_center_size(Pos2::new(r.right() - 32.0, r.top() + 15.0), Vec2::splat(14.0));
+                    let hovering = resp.hovered() || dresp.hovered();
+                    let xresp = ui.allocate_rect(xr, Sense::click()).on_hover_text("Remove from the chain");
                     if !modal {
                         if dresp.clicked() {
                             set_b(setter, &p.sh[si].on, !on);
+                        } else if xresp.clicked() && (hovering || xresp.hovered()) {
+                            remove = Some(si);
+                        } else if resp.drag_started() {
+                            gui.tab_drag = Some(si);
                         } else if resp.clicked() {
                             set_state(&|s| s.selected = si as u8);
                         }
                     }
+                    let r = if dragging_me {
+                        // the dragged tab follows the pointer
+                        let px = pointer.map(|pp| pp.x - tw * 0.5).unwrap_or(r.left());
+                        Rect::from_min_size(Pos2::new(px.clamp(o.x + 14.0, o.x + BASE_W - 14.0 - tw), r.top() - 3.0), r.size())
+                    } else {
+                        r
+                    };
+                    // the dragged tab is drawn on top of the others
+                    let painter = if dragging_me { ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dragged_tab"))) } else { painter.clone() };
                     let fill = if is_sel { PANEL2 } else if resp.hovered() { Color32::from_rgb(0x1c, 0x20, 0x27) } else { PANEL };
-                    painter.rect_filled(r, CornerRadius::same(7), fill);
-                    painter.rect_stroke(r, CornerRadius::same(7), Stroke::new(if is_sel { 1.5f32 } else { 1.0f32 }, if is_sel { kcol } else { LINE }), StrokeKind::Inside);
+                    painter.rect_filled(r, CornerRadius::same(7), if dragging_me { PANEL2 } else { fill });
+                    painter.rect_stroke(r, CornerRadius::same(7), Stroke::new(if is_sel || dragging_me { 1.5f32 } else { 1.0f32 }, if is_sel || dragging_me { kcol } else { LINE }), StrokeKind::Inside);
                     if on {
                         painter.rect_filled(Rect::from_min_size(r.min + Vec2::new(8.0, 0.0), Vec2::new(r.width() - 16.0, 2.5)), CornerRadius::same(1), kcol);
                     }
                     painter.text(Pos2::new(r.left() + 10.0, r.top() + 15.0), Align2::LEFT_CENTER, k.name(), pf(12.5), if on { TEXT } else { DIM });
+                    let dc = Pos2::new(r.right() - 14.0, r.top() + 15.0);
                     if on {
-                        painter.circle_filled(dot.center(), 5.0, kcol);
+                        painter.circle_filled(dc, 5.0, kcol);
                     } else {
-                        painter.circle_stroke(dot.center(), 5.0, Stroke::new(1.3f32, if dresp.hovered() { kcol } else { FAINT }));
+                        painter.circle_stroke(dc, 5.0, Stroke::new(1.3f32, if dresp.hovered() { kcol } else { FAINT }));
+                    }
+                    if (hovering || xresp.hovered()) && !dragging_me {
+                        painter.text(Pos2::new(r.right() - 32.0, r.top() + 15.0), Align2::CENTER_CENTER, "×", pf(14.0), if xresp.hovered() { HOT } else { DIM });
                     }
                     let thumb = Rect::from_min_max(Pos2::new(r.left() + 9.0, r.top() + 27.0), Pos2::new(r.right() - 9.0, r.bottom() - 6.0));
                     let path = wave_path(&st.waves[si][0], thumb, 80.0);
@@ -745,6 +866,61 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                     if on {
                         let ph = (shared.phase[si].load(Ordering::Relaxed) + p.sh[si].phase.value() / 360.0).rem_euclid(1.0);
                         painter.vline(thumb.left() + ph * thumb.width(), thumb.y_range(), Stroke::new(1.0f32, TEXT.gamma_multiply(0.6)));
+                    }
+                }
+                // drop marker / finish the drag
+                if let (Some(si), Some(dp)) = (gui.tab_drag, drop_pos) {
+                    let from = chain.iter().position(|&c| c == si).unwrap_or(0);
+                    if dp != from {
+                        let xm = if dp > from { slot_x(dp) + tw + gap * 0.5 } else { slot_x(dp) - gap * 0.5 };
+                        painter.vline(o.x + xm, (o.y + ty - 2.0)..=(o.y + ty + th + 2.0), Stroke::new(2.5f32, kc(Kind::ALL[si])));
+                    }
+                    if ui.input(|i| i.pointer.any_released()) {
+                        if dp != from {
+                            let mut c = chain.clone();
+                            let v = c.remove(from);
+                            c.insert(dp, v);
+                            let rest: Vec<u8> = st.order.iter().copied().filter(|&i| !st.present[i as usize]).collect();
+                            let order: Vec<u8> = c.iter().map(|&i| i as u8).chain(rest).collect();
+                            set_state(&|s| s.order = order.clone());
+                        }
+                        gui.tab_drag = None;
+                    }
+                }
+                if gui.tab_drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+                    gui.tab_drag = None;
+                }
+                if let Some(si) = remove {
+                    set_b(setter, &p.sh[si].on, false);
+                    set_state(&|s| {
+                        s.present[si] = false;
+                        s.sanitize();
+                    });
+                }
+                // "+": add a shaper
+                let absent: Vec<usize> = (0..N_SHAPERS).filter(|&i| !st.present[i]).collect();
+                if !absent.is_empty() {
+                    let mut items: Vec<(String, Color32)> = absent.iter().map(|&i| (Kind::ALL[i].name().to_string(), kc(Kind::ALL[i]))).collect();
+                    if absent.len() > 1 {
+                        items.push(("All shapers".into(), TEXT));
+                    }
+                    let pr = rect(slot_x(chain.len()), ty, plus_w, th);
+                    if let Some(i) = menu_btn(ui, "addshaper", pr, "+", &items, TEXT, "Add a shaper to the chain.", 22.0).filter(|_| !modal) {
+                        let add: Vec<usize> = if i < absent.len() { vec![absent[i]] } else { absent.clone() };
+                        for &a in &add {
+                            set_b(setter, &p.sh[a].on, true);
+                        }
+                        let first = add[0];
+                        set_state(&|s| {
+                            for &a in &add {
+                                s.present[a] = true;
+                                // to the end of the chain
+                                s.order.retain(|&o| o as usize != a);
+                                let at = s.order.iter().filter(|&&o| s.present[o as usize] && o as usize != a).count();
+                                s.order.insert(at.min(s.order.len()), a as u8);
+                            }
+                            s.selected = first as u8;
+                        });
                     }
                 }
 
@@ -1033,11 +1209,23 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 } else {
                     painter.text(Pos2::new(er.right() - 10.0, inner.bottom() - 8.0), Align2::RIGHT_CENTER, kind.about(), pf(10.0), FAINT);
                 }
-                if on {
+                if !st.present.iter().any(|&x| x) {
+                    painter.rect_filled(er.shrink(1.0), CornerRadius::same(8), EDIT_BG);
+                    painter.text(er.center(), Align2::CENTER_CENTER, "The chain is empty · add a shaper with + above", pf(14.0), DIM);
+                } else if on {
                     let ph = (shared.phase[sel].load(Ordering::Relaxed) + sp.phase.value() / 360.0).rem_euclid(1.0);
                     let yv = shared.value[sel][band].load(Ordering::Relaxed);
                     let c = px(ph, yv);
                     painter.vline(c.x, er.y_range(), Stroke::new(1.0f32, TEXT.gamma_multiply(0.35)));
+                    // the right channel runs ahead by Stereo: its own (hollow) playhead
+                    let spr = sp.spread.value() / 360.0;
+                    if spr > 0.001 {
+                        let pr = (ph + spr).rem_euclid(1.0);
+                        let cr = px(pr, w_now.eval(pr));
+                        painter.vline(cr.x, er.y_range(), Stroke::new(1.0f32, col.gamma_multiply(0.35)));
+                        painter.circle_stroke(cr, 5.0, Stroke::new(2.0f32, TEXT));
+                        painter.text(cr + Vec2::new(8.0, -10.0), Align2::LEFT_CENTER, "R", pf(9.5), DIM);
+                    }
                     painter.circle_filled(c, 6.0, TEXT);
                     painter.circle_filled(c, 3.5, col);
                 } else {
@@ -1154,11 +1342,14 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 panel(ui, rk, &kind.name().to_uppercase(), col);
                 // quick presets
                 {
-                    let q = presets::quick(kind);
-                    let names: Vec<&str> = q.iter().map(|(n, _)| *n).collect();
-                    if let Some(i) = combo(ui, &sid("quick"), rect(14.0 + wk - 12.0 - 140.0, ya + 4.0, 140.0, 22.0), &names, usize::MAX, "Quick presets", "Set up this shaper in one click (only this shaper changes).") {
-                        let (n, d) = &q[i];
-                        presets::apply(setter, p, d, Some(kind));
+                    let pick = {
+                        let q = &gui.lib.as_ref().unwrap().quick[sel];
+                        let names: Vec<&str> = q.iter().map(|(n, _)| *n).collect();
+                        combo(ui, &sid("quick"), rect(14.0 + wk - 12.0 - 140.0, ya + 4.0, 140.0, 22.0), &names, usize::MAX, "Quick presets", "Set up this shaper in one click (only this shaper changes).")
+                    };
+                    if let Some(i) = pick.filter(|_| !modal) {
+                        let (n, d) = gui.lib.as_ref().unwrap().quick[sel][i].clone();
+                        presets::apply(setter, p, &d, Some(kind));
                         bump(&shared);
                         gui.status = Some((format!("{}: {}", kind.name(), n), now));
                     }
@@ -1223,6 +1414,10 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                         if btn(ui, rect(xe + we - 12.0 - 44.0, ya + 4.0, 44.0, 22.0), "On", c_on, col, "Compressor on / off (after the shape, per band in multiband).").clicked() && !modal {
                             set_b(setter, &p.v_comp, !c_on);
                         }
+                        let vsc = p.v_sc.value();
+                        if btn(ui, rect(xe + we - 12.0 - 44.0 - 6.0 - 54.0 - 6.0 - 40.0, ya + 4.0, 40.0, 22.0), "SC", vsc, col, "Sidechain: the compressor listens to the plugin's sidechain input\n(route a kick or a bus to it in your DAW).").clicked() && !modal {
+                            set_b(setter, &p.v_sc, !vsc);
+                        }
                         let au = p.v_auto.value();
                         if btn(ui, rect(xe + we - 12.0 - 44.0 - 6.0 - 54.0, ya + 4.0, 54.0, 22.0), "Auto", au, col, "Automatic makeup gain.").clicked() && !modal {
                             set_b(setter, &p.v_auto, !au);
@@ -1252,8 +1447,12 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                         if btn(ui, rect(xe + we - 12.0 - 44.0, ya + 4.0, 44.0, 22.0), "On", e_on, col, "The input level moves the shape's value too.").clicked() && !modal {
                             set_b(setter, &sp.env_on, !e_on);
                         }
+                        let esc = sp.env_sc.value();
+                        if btn(ui, rect(xe + we - 12.0 - 44.0 - 6.0 - 40.0, ya + 4.0, 40.0, 22.0), "SC", esc, col, "Sidechain: the envelope follows the plugin's sidechain input instead of the signal.").clicked() && !modal {
+                            set_b(setter, &sp.env_sc, !esc);
+                        }
                         if matches!(kind, Kind::Filter | Kind::Width) {
-                            enum_combo::<EnvMode>(ui, setter, &sp.env_mode, &sid("emode"), rect(xe + we - 12.0 - 44.0 - 6.0 - 110.0, ya + 4.0, 110.0, 22.0), "", "Add: shape + envelope · Multiply: the shape scales the envelope.");
+                            enum_combo::<EnvMode>(ui, setter, &sp.env_mode, &sid("emode"), rect(xe + we - 12.0 - 44.0 - 6.0 - 40.0 - 6.0 - 100.0, ya + 4.0, 100.0, 22.0), "", "Add: shape + envelope · Multiply: the shape scales the envelope.");
                         }
                         let ks: [(&FloatParam, &str, &str, &str, bool); 5] = [
                             (&sp.env_amt, "Amount", "eamt", "How far the envelope moves the value, ±200 %.", true),
@@ -1279,7 +1478,7 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 let kyb = yb2 + 68.0;
                 let mut xp = 14.0;
                 // LFO
-                let w1 = 340.0;
+                let w1 = 420.0;
                 panel(ui, rect(xp, yb2, w1, hb2), "LFO", col);
                 let mode = sp.mode.value();
                 let trig = sp.trigger.value();
@@ -1289,17 +1488,23 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                     enum_combo(ui, setter, &sp.rate, &sid("rate"), rect(xp + 12.0, yb2 + 82.0, 128.0, 21.0), "Length", "Length of one cycle: 1/128 to 32 bars.");
                     enum_combo(ui, setter, &sp.feel, &sid("feel"), rect(xp + 12.0, yb2 + 108.0, 128.0, 21.0), "", "Straight, dotted (×1.5) or triplet (×2/3).");
                 }
-                let mut kx2 = xp + 186.0;
-                if mode == Mode::Hz {
-                    knob(ui, setter, &sp.hz, "Speed", &sid("hz"), at(kx2, kyb - 6.0), kr, "Speed in Hz: 0.02 Hz to 5 kHz.", false, col, 64.0);
-                    kx2 += 76.0;
-                }
-                if trig.audio() {
-                    knob(ui, setter, &p.trig_db, "Trig level", "atrig", at(kx2, kyb - 6.0), kr, "Input level a hit must reach to restart the cycle.", false, col, 64.0);
-                    kx2 += 76.0;
-                }
-                if kx2 < xp + w1 - 30.0 {
-                    knob(ui, setter, &sp.phase, "Phase", &sid("ph"), at(kx2, kyb - 6.0), kr, "Moves the shape against the beat.", false, col, 64.0);
+                // knobs: speed / trigger level when they apply, then phase, swing, stereo phase
+                {
+                    let mut ks: Vec<(&FloatParam, &str, String, &str)> = Vec::new();
+                    if mode == Mode::Hz {
+                        ks.push((&sp.hz, "Speed", sid("hz"), "Speed in Hz: 0.02 Hz to 5 kHz."));
+                    }
+                    if trig.audio() {
+                        ks.push((&p.trig_db, "Trig level", "atrig".into(), "Input level a hit must reach to restart the cycle."));
+                    }
+                    ks.push((&sp.phase, "Phase", sid("ph"), "Moves the shape against the beat."));
+                    ks.push((&sp.swing, "Swing", sid("sw"), "Delays every second grid step (the editor's grid): groove for gates and steps."));
+                    ks.push((&sp.spread, "Stereo", sid("spr"), "Phase offset of the right channel: 180° = left and right move in turns.\n(Volume, Filter, Time, Noise, Crush, Drive.)"));
+                    let x0 = xp + 160.0;
+                    let stp = ((w1 - 160.0 - 8.0) / ks.len() as f32).min(64.0);
+                    for (i, (fp, l, id, tip)) in ks.into_iter().enumerate() {
+                        knob(ui, setter, fp, l, &id, at(x0 + stp * (i as f32 + 0.5), kyb - 8.0), kr - 2.0, tip, false, col, stp - 4.0);
+                    }
                 }
                 painter.text(at(xp + 160.0, yb2 + hb2 - 30.0), Align2::LEFT_CENTER, cycle_text(sp, tempo), pf(11.0), TEXT);
                 let hint = match (mode, trig) {
@@ -1319,13 +1524,13 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 xp += w2 + 10.0;
 
                 // multiband
-                let w3 = 260.0;
+                let w3 = 250.0;
                 panel(ui, rect(xp, yb2, w3, hb2), "MULTIBAND", col);
                 if btn(ui, rect(xp + w3 - 12.0 - 44.0, yb2 + 4.0, 44.0, 22.0), "On", multi, col, "Three bands, each with its own shape.").clicked() && !modal {
                     set_b(setter, &sp.multiband, !multi);
                 }
-                knob(ui, setter, &sp.x_lo, "Low / Mid", &sid("xl"), at(xp + 70.0, kyb - 10.0), kr, "Split between the low and the mid band.", false, col, 64.0);
-                knob(ui, setter, &sp.x_hi, "Mid / High", &sid("xh"), at(xp + 190.0, kyb - 10.0), kr, "Split between the mid and the high band.", false, col, 64.0);
+                knob(ui, setter, &sp.x_lo, "Low / Mid", &sid("xl"), at(xp + 66.0, kyb - 10.0), kr, "Split between the low and the mid band.", false, col, 64.0);
+                knob(ui, setter, &sp.x_hi, "Mid / High", &sid("xh"), at(xp + 184.0, kyb - 10.0), kr, "Split between the mid and the high band.", false, col, 64.0);
                 let solo = shared.solo[sel].load(Ordering::Relaxed);
                 let bwid = (w3 - 24.0 - 12.0) / 3.0;
                 for b in 0..N_BANDS {
@@ -1354,6 +1559,10 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 panel(ui, rect(xp, yb2, w4, hb2), "OUTPUT", Color32::from_rgb(0x7f, 0xd6, 0xa0));
                 let s4 = (w4 - 24.0) / 3.0;
                 let ocol = Color32::from_rgb(0xc8, 0xcd, 0xd8);
+                let sc_ = p.safe_clip.value();
+                if btn(ui, rect(xp + w4 - 12.0 - 48.0, yb2 + 4.0, 48.0, 22.0), "Clip", sc_, Color32::from_rgb(0x7f, 0xd6, 0xa0), "Safety clipper: soft-limits the output just below 0 dBFS\n(transparent below -1 dB). Keeps resonance and drive from clipping your DAW.").clicked() && !modal {
+                    set_b(setter, &p.safe_clip, !sc_);
+                }
                 knob(ui, setter, &p.in_gain, "Input", "in", at(xp + 12.0 + s4 * 0.5, kyb), kr, "Level into the chain.", true, ocol, s4 - 8.0);
                 knob(ui, setter, &p.mix, "Master mix", "gmix", at(xp + 12.0 + s4 * 1.5, kyb), kr, "Blends the end of the chain with the untouched input.", false, ocol, s4 - 8.0);
                 knob(ui, setter, &p.out_gain, "Output", "out", at(xp + 12.0 + s4 * 2.5, kyb), kr, "Output level.", true, ocol, s4 - 8.0);
@@ -1361,7 +1570,7 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                 // status line
                 if let Some((msg, t)) = &gui.status {
                     if now - t < 2.5 {
-                        painter.text(at(BASE_W * 0.5, 145.0 - 4.0), Align2::CENTER_BOTTOM, msg, pf(10.5), GOLD);
+                        painter.text(at(BASE_W * 0.5, 168.0), Align2::CENTER_CENTER, msg, pf(11.0), GOLD);
                     } else {
                         gui.status = None;
                     }
@@ -1418,10 +1627,13 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                     let mut to_load: Option<PresetData> = None;
                     let mut fav_toggle: Option<String> = None;
                     let mut delete: Option<String> = None;
-                    let favs = gui.lib.as_ref().map(|l| l.favs.clone()).unwrap_or_default();
+                    let lib_ref = gui.lib.as_ref().unwrap();
+                    let favs = &lib_ref.favs;
+                    let rows: Vec<(bool, &PresetData)> = filtered.iter().map(|&(u, i)| (u, lib_ref.get(u, i))).collect();
                     ui.allocate_new_ui(UiBuilder::new().max_rect(list_rect), |ui| {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                            for (is_user, d) in filtered.iter() {
+                            for &(is_user, d) in rows.iter() {
+                                let is_user = &is_user;
                                 let (r, resp) = ui.allocate_exact_size(Vec2::new(list_rect.width() - 10.0, 26.0), Sense::click());
                                 let cur = d.name == st.preset;
                                 let pnt = ui.painter();
@@ -1452,7 +1664,7 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                                     } else if *is_user && trash.contains(pos) {
                                         delete = Some(d.name.clone());
                                     } else {
-                                        to_load = Some(d.clone());
+                                        to_load = Some((*d).clone());
                                     }
                                 }
                             }
@@ -1496,9 +1708,19 @@ pub fn create(params: Arc<WaveCubeParams>, shared: Arc<Shared>) -> Option<Box<dy
                     painter.text(dr.min + Vec2::new(18.0, 22.0), Align2::LEFT_CENTER, "Save preset", FontId::proportional(16.0), TEXT);
                     painter.text(dr.min + Vec2::new(18.0, 56.0), Align2::LEFT_CENTER, "Name", pf(11.0), DIM);
                     let ner = Rect::from_min_size(dr.min + Vec2::new(100.0, 44.0), Vec2::new(300.0, 26.0));
-                    let te = ui.put(ner, egui::TextEdit::singleline(&mut gui.save_name).hint_text("My preset").font(pf(13.0)).margin(egui::Margin::symmetric(8, 4)));
-                    if !te.has_focus() && gui.save_name.is_empty() {
-                        te.request_focus();
+                    let save_name = &mut gui.save_name;
+                    let mut out = ui
+                        .allocate_new_ui(UiBuilder::new().max_rect(ner), |ui| {
+                            egui::TextEdit::singleline(save_name).hint_text("My preset").font(pf(13.0)).margin(egui::Margin::symmetric(8, 4)).desired_width(ner.width()).show(ui)
+                        })
+                        .inner;
+                    if gui.save_focus {
+                        // first frame of the dialog: focus the name and select it, ready to type over
+                        out.response.request_focus();
+                        let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(gui.save_name.chars().count()));
+                        out.state.cursor.set_char_range(Some(all));
+                        out.state.store(ui.ctx(), out.response.id);
+                        gui.save_focus = false;
                     }
                     painter.text(dr.min + Vec2::new(18.0, 94.0), Align2::LEFT_CENTER, "Category", pf(11.0), DIM);
                     let cats: Vec<&str> = CATEGORIES.to_vec();

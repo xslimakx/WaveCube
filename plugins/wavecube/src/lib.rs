@@ -471,6 +471,13 @@ pub struct ShaperParams {
     pub env_thr: FloatParam,
     #[id = "envmode"]
     pub env_mode: EnumParam<EnvMode>,
+    #[id = "envsc"]
+    pub env_sc: BoolParam,
+    // groove / stereo
+    #[id = "swing"]
+    pub swing: FloatParam,
+    #[id = "spread"]
+    pub spread: FloatParam,
 }
 
 impl ShaperParams {
@@ -504,6 +511,13 @@ impl ShaperParams {
             env_rel: ms(format!("{n} Envelope Release"), 150.0, 5.0, 2000.0),
             env_thr: db(format!("{n} Envelope Threshold"), -40.0, -60.0, 0.0),
             env_mode: EnumParam::new(format!("{n} Envelope Mode"), EnvMode::Add),
+            env_sc: BoolParam::new(format!("{n} Envelope Sidechain"), false),
+            swing: percent(format!("{n} Swing"), 0.0),
+            spread: FloatParam::new(format!("{n} Stereo Phase"), 0.0, lin(0.0, 180.0))
+                .with_unit("°")
+                .with_step_size(1.0)
+                .with_value_to_string(Arc::new(|v| format!("{:.0}", v)))
+                .with_string_to_value(parse_num("°")),
         }
     }
 }
@@ -523,6 +537,9 @@ pub struct State {
     pub waves: Vec<Vec<Wave>>,
     /// chain order: indices into Kind::ALL
     pub order: Vec<u8>,
+    /// shapers in the chain (the others are removed: not shown, not processed)
+    #[serde(default = "all_present")]
+    pub present: Vec<bool>,
     #[serde(default)]
     pub slots: Vec<Option<Slot>>,
     #[serde(default)]
@@ -532,11 +549,16 @@ pub struct State {
     pub grid: u8,
 }
 
+fn all_present() -> Vec<bool> {
+    vec![true; N_SHAPERS]
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {
             waves: Kind::ALL.iter().map(|k| vec![k.default_wave(); N_BANDS]).collect(),
             order: (0..N_SHAPERS as u8).collect(),
+            present: (0..N_SHAPERS).map(|i| i == 0).collect(),
             slots: vec![None; N_SLOTS],
             preset: "Init".into(),
             selected: 0,
@@ -566,6 +588,7 @@ impl State {
                 self.order.push(i as u8);
             }
         }
+        self.present.resize(N_SHAPERS, true);
         self.slots.resize(N_SLOTS, None);
         for s in self.slots.iter_mut().flatten() {
             s.shaper = s.shaper.min(N_SHAPERS as u8 - 1);
@@ -573,6 +596,11 @@ impl State {
             s.wave.sanitize();
         }
         self.selected = self.selected.min(N_SHAPERS as u8 - 1);
+        if !self.present[self.selected as usize] {
+            if let Some(&first) = self.order.iter().find(|&&i| self.present[i as usize]) {
+                self.selected = first;
+            }
+        }
         self.band = self.band.min(N_BANDS as u8 - 1);
         if !GRIDS.contains(&self.grid) {
             self.grid = 16;
@@ -599,6 +627,8 @@ pub struct WaveCubeParams {
     pub trig_db: FloatParam,
     #[id = "midisw"]
     pub midi_switch: BoolParam,
+    #[id = "safe"]
+    pub safe_clip: BoolParam,
 
     #[nested(array, group = "Shaper")]
     pub sh: [ShaperParams; N_SHAPERS],
@@ -622,6 +652,8 @@ pub struct WaveCubeParams {
     pub v_makeup: FloatParam,
     #[id = "vauto"]
     pub v_auto: BoolParam,
+    #[id = "vsc"]
+    pub v_sc: BoolParam,
     // ---- Filter
     #[id = "ftype"]
     pub f_type: EnumParam<FilterType>,
@@ -708,6 +740,7 @@ impl Default for WaveCubeParams {
             mix: percent("Master Mix", 1.0),
             trig_db: db("Audio Trigger Threshold", -24.0, -60.0, 0.0),
             midi_switch: BoolParam::new("MIDI Switch", false),
+            safe_clip: BoolParam::new("Safety Clipper", true),
             sh: Kind::ALL.map(ShaperParams::new),
 
             v_trim: db("Volume Trim", 0.0, -24.0, 24.0),
@@ -721,6 +754,7 @@ impl Default for WaveCubeParams {
             v_rel: ms("Compressor Release", 150.0, 50.0, 2000.0),
             v_makeup: db("Compressor Makeup", 0.0, -12.0, 24.0),
             v_auto: BoolParam::new("Compressor Auto Makeup", true),
+            v_sc: BoolParam::new("Compressor Sidechain", false),
 
             f_type: EnumParam::new("Filter Type", FilterType::Lp12),
             f_lo: freq("Filter Low", 250.0, 20.0, 21000.0),
@@ -845,6 +879,13 @@ impl Plugin for WaveCube {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            aux_input_ports: &[new_nonzero_u32(2)],
+            names: PortNames { layout: Some("Stereo + sidechain"), main_input: None, main_output: None, aux_inputs: &["Sidechain"], aux_outputs: &[] },
+            ..AudioIOLayout::const_default()
+        },
         AudioIOLayout { main_input_channels: NonZeroU32::new(2), main_output_channels: NonZeroU32::new(2), ..AudioIOLayout::const_default() },
         AudioIOLayout { main_input_channels: NonZeroU32::new(1), main_output_channels: NonZeroU32::new(1), ..AudioIOLayout::const_default() },
     ];
@@ -883,7 +924,7 @@ impl Plugin for WaveCube {
         self.engine.reset();
     }
 
-    fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
+    fn process(&mut self, buffer: &mut Buffer, aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         demo_input(buffer);
         let t = context.transport();
         let transport = dsp::Transport { tempo: t.tempo.unwrap_or(120.0), pos_beats: t.pos_beats(), playing: t.playing };
@@ -900,7 +941,16 @@ impl Plugin for WaveCube {
 
         let mut next_event = context.next_event();
         self.engine.begin_block(&ep, &transport, &self.shared);
+        let sc_buf = aux.inputs.first().map(|b| b.as_slice_immutable());
         for (i, mut frame) in buffer.iter_samples().enumerate() {
+            let sc = match sc_buf {
+                Some(ch) if !ch.is_empty() => {
+                    let l = ch[0].get(i).copied().unwrap_or(0.0);
+                    let r = ch.get(1).and_then(|c| c.get(i)).copied().unwrap_or(l);
+                    [l, r]
+                }
+                _ => [0.0; 2],
+            };
             let mut note: Option<u8> = None;
             while let Some(ev) = next_event {
                 if ev.timing() as usize > i {
@@ -921,7 +971,7 @@ impl Plugin for WaveCube {
             if nch == 1 {
                 x[1] = x[0];
             }
-            let y = self.engine.process(x, nch == 2, note, &ep, &self.shared);
+            let y = self.engine.process(x, sc, nch == 2, note, &ep, &self.shared);
             for (c, s) in frame.iter_mut().enumerate().take(nch) {
                 *s = y[c];
             }
@@ -988,7 +1038,7 @@ mod tests {
         let mut back: State = serde_json::from_str(&s).unwrap();
         back.sanitize();
         assert_eq!(back, st);
-        let mut bad = State { waves: vec![], order: vec![3, 3, 9, 0], slots: vec![], preset: String::new(), selected: 40, band: 9, grid: 7 };
+        let mut bad = State { waves: vec![], order: vec![3, 3, 9, 0], present: vec![], slots: vec![], preset: String::new(), selected: 40, band: 9, grid: 7 };
         bad.sanitize();
         assert_eq!(bad.waves.len(), N_SHAPERS);
         assert!(bad.waves.iter().all(|w| w.len() == N_BANDS));

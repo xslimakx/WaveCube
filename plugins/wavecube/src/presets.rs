@@ -106,6 +106,11 @@ impl Builder {
 
     pub fn finish(&mut self, name: &str, category: &str) -> PresetData {
         let mut state = self.state.clone();
+        // the shapers that are on are the ones in the chain
+        state.present = Kind::ALL.iter().map(|k| self.vals.get(&format!("on_{}", k.index() + 1)).copied().unwrap_or(0.0) > 0.5).collect();
+        if !state.present.iter().any(|&p| p) {
+            state.present[0] = true;
+        }
         state.preset = name.to_string();
         state.sanitize();
         PresetData { name: name.into(), category: category.into(), author: "Factory".into(), params: self.vals.clone(), state }
@@ -191,6 +196,13 @@ pub fn factory() -> Vec<PresetData> {
     });
     add("Tremolo 1/16T", "Rhythmic", &|b| {
         b.on(Volume).rate(Volume, Rate::Sixteenth).k(Volume, "feel", Feel::Triplet.to_index() as f32).k(Volume, "amount", 0.6).wave(Volume, Wave::preset(W::Sine));
+    });
+
+    add("Swing Gate 1/16", "Rhythmic", &|b| {
+        b.on(Volume).rate(Volume, Rate::Bar1).k(Volume, "smooth", 2.5).k(Volume, "swing", 0.6).wave(Volume, Wave::preset(W::Gate16));
+    });
+    add("Stereo Tremolo", "Rhythmic", &|b| {
+        b.on(Volume).rate(Volume, Rate::Eighth).k(Volume, "amount", 0.8).k(Volume, "spread", 180.0).wave(Volume, Wave::preset(W::Sine));
     });
 
     // ---- Filter
@@ -305,6 +317,14 @@ pub fn factory() -> Vec<PresetData> {
     add("Gentle Glue", "Mixing", &|b| {
         b.on(Volume).wave(Volume, Wave::flat(1.0)).g("vcomp", 1.0).g("vthr", -18.0).g("vratio", 2.0).g("vatt", 20.0).g("vrel", 200.0);
     });
+    add("Kick Sidechain (SC input)", "Mixing", &|b| {
+        b.on(Volume).wave(Volume, Wave::flat(1.0));
+        b.g("vcomp", 1.0).g("vsc", 1.0).g("vthr", -30.0).g("vratio", 8.0).g("vatt", 1.0).g("vrel", 160.0).g("vauto", 0.0);
+    });
+    add("Stereo Wobble", "Filter", &|b| {
+        b.on(Filter).select(Filter).rate(Filter, Rate::Quarter).k(Filter, "spread", 90.0).wave(Filter, Wave::preset(W::Sine));
+        b.g("ftype", FilterType::Lp24.to_index() as f32).g("flo", 150.0).g("fhi", 5000.0).g("fres", 0.55);
+    });
     add("Hit-triggered Pump", "Mixing", &|b| {
         b.on(Volume).rate(Volume, Rate::Quarter).k(Volume, "trig", Trigger::Audio.to_index() as f32).wave(Volume, Wave::preset(W::Pump));
     });
@@ -312,6 +332,8 @@ pub fn factory() -> Vec<PresetData> {
         b.on(Time).select(Time).rate(Time, Rate::Bar2).k(Time, "trig", Trigger::MidiOnce.to_index() as f32).g("trange", TimeRange::Bar2.to_index() as f32);
         b.wave(Time, Wave::from(&[Pt::new(0.0, 1.0, -0.4), Pt::new(1.0, 0.0, 0.0)]));
     });
+    // grouped by category for the browser
+    out.sort_by_key(|p| CATEGORIES.iter().position(|c| *c == p.category).unwrap_or(99));
     out
 }
 
@@ -484,6 +506,7 @@ pub fn apply(setter: &ParamSetter, p: &WaveCubeParams, data: &PresetData, only: 
     match only {
         Some(k) => {
             st.waves[k.index()] = data.state.waves[k.index()].clone();
+            st.present[k.index()] = true;
             st.selected = k.index() as u8;
         }
         None => {
