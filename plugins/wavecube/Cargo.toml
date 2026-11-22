@@ -1,0 +1,26 @@
+[package]
+name = "wavecube"
+description = "WaveCube - multi-shaper LFO effect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["vst3"] }
+nih_plug_egui = { path = "../../vendor/nih_plug_egui" }
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "9a0b42c09d712777b2edb4c5e0cb6baf21e988f0" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+
+[features]
+standalone = ["nih_plug/standalone"]
+
+[[bin]]
+name = "wavecube"
+path = "src/main.rs"
+required-features = ["standalone"]
