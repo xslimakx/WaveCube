@@ -370,9 +370,11 @@ pub(super) fn key_mods(mods: KeyButMask) -> Modifiers {
         // X11's mod keys are configurable, but this seems
         // like a reasonable default for US keyboards, at least,
         // where the "windows" key seems to be MOD_MASK_4.
-        (KeyButMask::BUTTON1, Modifiers::ALT),
-        (KeyButMask::BUTTON2, Modifiers::NUM_LOCK),
-        (KeyButMask::BUTTON4, Modifiers::META),
+        // Mod1 = Alt, Mod2 = Num Lock, Mod4 = the "windows" key (upstream used the BUTTON masks:
+        // holding the left mouse button looked like Alt)
+        (KeyButMask::MOD1, Modifiers::ALT),
+        (KeyButMask::MOD2, Modifiers::NUM_LOCK),
+        (KeyButMask::MOD4, Modifiers::META),
         (KeyButMask::LOCK, Modifiers::CAPS_LOCK),
     ];
     for (mask, modifiers) in &key_masks {

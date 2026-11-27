@@ -100,6 +100,8 @@ pub struct Gui {
     pub scope_out: [f32; SCOPE_N],
     pub freeze: bool,
     pub drag: Option<Drag>,
+    /// point added by a click and when (its double-click must not delete it again)
+    pub just_added: Option<(usize, f64)>,
     pub sel_pts: Vec<usize>,
     pub move_orig: Option<Wave>,
     pub undo: Vec<Snapshot>,
@@ -143,6 +145,7 @@ impl Gui {
             scope_out: [0.0; SCOPE_N],
             freeze: false,
             drag: None,
+            just_added: None,
             sel_pts: vec![],
             move_orig: None,
             undo: vec![],

@@ -417,8 +417,53 @@ impl Wave {
         }
         let x = x.clamp(0.0, 1.0);
         let i = self.pts.iter().position(|p| p.x > x).unwrap_or(self.pts.len() - 1).max(1);
-        let c = self.pts[i - 1].c;
-        self.pts.insert(i, Pt::new(x, y.clamp(0.0, 1.0), c));
+        // the new segment after the point starts straight (copying the old bend into it made
+        // unexpected waves); the segment before keeps its bend
+        self.pts.insert(i, Pt::new(x, y.clamp(0.0, 1.0), 0.0));
+        Some(i)
+    }
+
+    /// Adds a point ON the shape at `x` (snapped or not): the shape stays the same, a bent
+    /// segment is split into two bent halves that follow the old curve.
+    pub fn insert_on_curve(&mut self, x: f32) -> Option<usize> {
+        if self.pts.len() >= MAX_POINTS {
+            return None;
+        }
+        let x = x.clamp(0.0, 1.0);
+        let i = self.pts.iter().position(|p| p.x > x).unwrap_or(self.pts.len() - 1).max(1);
+        let (a, b) = (self.pts[i - 1], self.pts[i]);
+        if (b.x - a.x).abs() < 1e-6 || (x - a.x).abs() < 1e-6 || (b.x - x).abs() < 1e-6 {
+            // on an existing point: nothing to add
+            return None;
+        }
+        let t0 = (x - a.x) / (b.x - a.x);
+        let curve = |t: f32| a.y + (b.y - a.y) * bend(t, a.c);
+        let ym = curve(t0);
+        // best bend for each half (least squares over the half)
+        let fit = |from: f32, to: f32, y0: f32, y1: f32| -> f32 {
+            if (y1 - y0).abs() < 1e-5 {
+                return 0.0;
+            }
+            let mut best = (f32::MAX, 0.0);
+            for k in 0..=400 {
+                let c = -1.0 + k as f32 / 200.0;
+                let mut e = 0.0;
+                for j in 1..16 {
+                    let u = j as f32 / 16.0;
+                    let want = curve(from + (to - from) * u);
+                    let got = y0 + (y1 - y0) * bend(u, c);
+                    e += (want - got) * (want - got);
+                }
+                if e < best.0 {
+                    best = (e, c);
+                }
+            }
+            best.1
+        };
+        let cl = fit(0.0, t0, a.y, ym);
+        let cr = fit(t0, 1.0, ym, b.y);
+        self.pts[i - 1].c = cl;
+        self.pts.insert(i, Pt::new(x, ym.clamp(0.0, 1.0), cr));
         Some(i)
     }
 
@@ -541,6 +586,22 @@ impl Wave {
         out.push(Pt::new(1.0, y1, 0.0));
         self.pts = out;
         self.sanitize();
+    }
+}
+
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+
+    #[test]
+    fn a_point_on_the_curve_keeps_the_shape() {
+        let mut w = Wave { pts: vec![Pt::new(0.0, 0.0, 0.0), Pt::new(0.5, 1.0, 0.7), Pt::new(1.0, 0.2, -0.5)] };
+        let before: Vec<f32> = (0..=200).map(|i| w.eval(i as f32 / 200.0)).collect();
+        assert!(w.insert_on_curve(0.2).is_some());
+        assert!(w.insert_on_curve(0.81).is_some());
+        assert!(w.insert_on_curve(0.5).is_none(), "a point already there");
+        let err = (0..=200).map(|i| (w.eval(i as f32 / 200.0) - before[i]).abs()).fold(0.0f32, f32::max);
+        assert!(err < 0.03, "shape changed by {err}");
     }
 }
 

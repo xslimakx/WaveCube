@@ -218,9 +218,20 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
         let major = i % beat_div == 0;
         painter.vline(xx, er.y_range(), Stroke::new(1.0f32, if major { Color32::from_rgb(0x28, 0x2d, 0x36) } else { Color32::from_rgb(0x18, 0x1b, 0x21) }));
     }
-    for i in 0..=8 {
-        let yy = inner.bottom() - inner.height() * i as f32 / 8.0;
-        painter.hline(er.x_range(), yy, Stroke::new(1.0f32, if i % 4 == 0 { Color32::from_rgb(0x24, 0x28, 0x30) } else { Color32::from_rgb(0x15, 0x18, 0x1d) }));
+    // the horizontal lines are exactly the heights points snap to (1/16): what you see is where
+    // a point lands
+    for i in 0..=16 {
+        let yy = inner.bottom() - inner.height() * i as f32 / 16.0;
+        let c = if i % 8 == 0 {
+            Color32::from_rgb(0x2a, 0x2f, 0x38)
+        } else if i % 4 == 0 {
+            Color32::from_rgb(0x20, 0x24, 0x2b)
+        } else if i % 2 == 0 {
+            Color32::from_rgb(0x18, 0x1b, 0x21)
+        } else {
+            Color32::from_rgb(0x13, 0x15, 0x1a)
+        };
+        painter.hline(er.x_range(), yy, Stroke::new(1.0f32, c));
     }
     let ln = cx.kind.lanes()[l];
     let title = if m { format!("{} · {} band", ln.name, BAND_NAMES[b].to_lowercase()) } else { ln.name.to_string() };
@@ -244,7 +255,7 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
     let pts = cur.pts.clone();
     let near_pt = |pos: Pos2| -> Option<usize> {
         let mut best = None;
-        let mut bd = 9.0f32;
+        let mut bd = 12.0f32;
         for (i, q) in pts.iter().enumerate() {
             let d = px(q.x, q.y).distance(pos);
             if d < bd {
@@ -261,7 +272,24 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
         }
         Some(px(0.5 * (a.x + bb.x), a.y + (bb.y - a.y) * bend(0.5, a.c)))
     };
-    let near_handle = |pos: Pos2| -> Option<usize> { (0..pts.len() - 1).find(|&i| handle_pos(i).map(|h| h.distance(pos) < 8.0).unwrap_or(false)) };
+    let near_handle = |pos: Pos2| -> Option<usize> { (0..pts.len() - 1).find(|&i| handle_pos(i).map(|h| h.distance(pos) < 10.0).unwrap_or(false)) };
+    // where a click on empty space puts a new point: on the line itself when the click is close
+    // to it (the shape stays as it is), otherwise at the snapped click
+    let on_line = |pos: Pos2| -> Option<f32> {
+        let (x, _) = to_xy(pos);
+        let xs = snap_x(x, snap_on);
+        let yl = cur.eval(xs);
+        let py = inner.bottom() - yl * inner.height();
+        if (py - pos.y).abs() < 10.0 { Some(xs) } else { None }
+    };
+    let new_point = |pos: Pos2| -> (f32, f32, bool) {
+        if let Some(xs) = on_line(pos) {
+            (xs, cur.eval(xs), true)
+        } else {
+            let (x, y) = to_xy(pos);
+            (snap_x(x, snap_on), snap_y(y, snap_on), false)
+        }
+    };
     // 1-shot end marker
     let end_x = inner.left() + lfo.end * inner.width();
     let end_handle = Rect::from_center_size(Pos2::new(end_x, er.top() + 7.0), Vec2::new(14.0, 14.0));
@@ -306,9 +334,9 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
             } else if let Some(i) = near_handle(start) {
                 Some(Drag::Curve(i, pts[i].c, start.y))
             } else {
-                let (x, y) = to_xy(start);
+                let (x, y, line) = new_point(start);
                 let mut w = cur.clone();
-                let idx = w.insert(snap_x(x, snap_on), snap_y(y, snap_on));
+                let idx = if line { w.insert_on_curve(x) } else { w.insert(x, y) };
                 if idx.is_some() {
                     edit_wave(cx.p, cx.shared, s, l, b, m, |dst| *dst = w);
                 }
@@ -402,24 +430,34 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
                         }
                         None => gui.sel_pts.clear(),
                     },
-                    Tool::Pointer => {}
+                    Tool::Pointer => {
+                        // one click on empty space: a new point (as in ShaperBox)
+                        if near_pt(pos).is_none() && near_handle(pos).is_none() && !near_end(pos) {
+                            gui.checkpoint(cx, "", cx.now);
+                            let (x, y, line) = new_point(pos);
+                            let mut w = cur.clone();
+                            let idx = if line { w.insert_on_curve(x) } else { w.insert(x, y) };
+                            if let Some(i) = idx {
+                                edit_wave(cx.p, cx.shared, s, l, b, m, |dst| *dst = w);
+                                gui.just_added = Some((i, cx.now));
+                            }
+                        }
+                    }
                 }
             }
         }
         if resp.double_clicked() && pointer {
             if let Some(pos) = resp.interact_pointer_pos() {
-                gui.checkpoint(cx, "", cx.now);
-                if let Some(i) = near_pt(pos) {
+                // the first click of this double-click may have just added the point: keep it
+                let fresh = gui.just_added.is_some_and(|(i, t)| cx.now - t < 0.6 && near_pt(pos) == Some(i));
+                if let Some(i) = near_pt(pos).filter(|_| !fresh) {
+                    gui.checkpoint(cx, "", cx.now);
                     edit_wave(cx.p, cx.shared, s, l, b, m, |w| w.remove(i));
                 } else if let Some(i) = near_handle(pos) {
+                    gui.checkpoint(cx, "", cx.now);
                     edit_wave(cx.p, cx.shared, s, l, b, m, |w| w.pts[i].c = 0.0);
-                } else {
-                    let (x, y) = to_xy(pos);
-                    let (x, y) = (snap_x(x, snap_on), snap_y(y, snap_on));
-                    edit_wave(cx.p, cx.shared, s, l, b, m, |w| {
-                        w.insert(x, y);
-                    });
                 }
+                gui.just_added = None;
             }
         }
         if resp.secondary_clicked() {
@@ -438,7 +476,7 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
     let _ = resp.on_hover_text(match gui.tool {
         Tool::Pen(_) => "Pen: click or drag to draw into the grid cells; the height is where you click.\nShift: toggle snapping.",
         Tool::Select => "Select: drag a box around points (Shift adds), drag selected points to move them together, Del deletes them, Esc clears.",
-        Tool::Pointer => "Drag points · drag the small rings to bend a segment\nDrag on empty space or double-click: new point\nDouble-click / right-click a point: delete\nShift: toggle snapping · Ctrl+Z / Ctrl+Shift+Z: undo / redo",
+        Tool::Pointer => "Click: new point (close to the line: right on the line, the shape stays) · drag it at once to place it\nDrag points · drag the small rings to bend a segment (double-click a ring: straight)\nDouble-click / right-click a point: delete\nShift: toggle snapping (grid lines = snap positions) · Ctrl+Z / Ctrl+Shift+Z: undo / redo",
     });
 
     // the shape (fresh from the state: the edits of this frame included)
@@ -491,8 +529,9 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
         };
         tag(Pos2::new(er.left() + 24.0, inner.top() + 2.0), Align2::LEFT_CENTER, ln.top.to_string(), DIM, 9.0);
         tag(Pos2::new(er.left() + 24.0, inner.bottom() - 2.0), Align2::LEFT_CENTER, ln.bottom.to_string(), DIM, 9.0);
-        tag(Pos2::new(er.right() - 10.0, inner.top() + 2.0), Align2::RIGHT_CENTER, title, col, 11.5);
-        tag(Pos2::new(er.right() - 10.0, inner.top() + 17.0), Align2::RIGHT_CENTER, format!("{len_txt}{trig}{}", if lfo.looping { "" } else { " · 1-shot" }), DIM, 9.5);
+        // kept clear of the end point (top right corner), so it is never hidden under them
+        tag(Pos2::new(er.right() - 26.0, inner.top() + 16.0), Align2::RIGHT_CENTER, title, col, 11.5);
+        tag(Pos2::new(er.right() - 26.0, inner.top() + 31.0), Align2::RIGHT_CENTER, format!("{len_txt}{trig}{}", if lfo.looping { "" } else { " · 1-shot" }), DIM, 9.5);
     }
     if let (Some(Drag::Box(a)), Some(bpos)) = (gui.drag, ui.input(|i| i.pointer.interact_pos())) {
         let r = Rect::from_two_pos(a, bpos);
@@ -506,6 +545,23 @@ pub fn editor(ui: &mut Ui, cx: &Cx, gui: &mut Gui) {
         painter.rect_filled(end_handle, CornerRadius::same(3), GOLD);
         painter.text(end_handle.center(), Align2::CENTER_CENTER, "◆", pf(8.0), BG);
         painter.text(Pos2::new(end_x + 10.0, er.top() + 7.0), Align2::LEFT_CENTER, "END", pf(8.5), GOLD);
+    }
+    // where a click would put a new point (ghost), and guide lines while a point moves
+    if pointer && gui.drag.is_none() {
+        if let Some(hp) = hover.filter(|hp| hov_pt.is_none() && hov_h.is_none() && !near_end(*hp)) {
+            let (x, y, line) = new_point(hp);
+            let g = px(x, y);
+            painter.vline(g.x, er.y_range(), Stroke::new(1.0f32, col.gamma_multiply(0.25)));
+            painter.circle_stroke(g, 5.0, Stroke::new(1.5f32, col.gamma_multiply(if line { 0.9 } else { 0.6 })));
+            painter.text(g + Vec2::new(8.0, -9.0), Align2::LEFT_CENTER, "+", pf(11.0), col.gamma_multiply(0.8));
+        }
+    }
+    if let Some(Drag::Point(i)) = gui.drag {
+        if let Some(q) = w_now.pts.get(i) {
+            let c = px(q.x, q.y);
+            painter.vline(c.x, er.y_range(), Stroke::new(1.0f32, col.gamma_multiply(0.35)));
+            painter.hline(er.x_range(), c.y, Stroke::new(1.0f32, col.gamma_multiply(0.35)));
+        }
     }
     // help line
     if let Some(hp) = hover {
